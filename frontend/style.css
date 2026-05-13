@@ -102,8 +102,8 @@ body {
 .main-content {
   flex: 1;
   padding: 28px 32px;
-  max-width: 1200px;
   overflow-x: hidden;
+  min-width: 0;
 }
 
 .view { display: none; }
@@ -419,8 +419,7 @@ tbody tr:hover { background: var(--bg); }
 .modal {
   background: var(--surface);
   border-radius: 12px;
-  width: 420px;
-  max-width: 95vw;
+  width: min(520px, 92vw);
   box-shadow: 0 8px 40px rgba(0,0,0,0.2);
 }
 
@@ -443,7 +442,7 @@ tbody tr:hover { background: var(--bg); }
 }
 .btn-close:hover { color: var(--text); }
 
-.modal-body { padding: 20px 24px; max-height: 80vh; overflow-y: auto; }
+.modal-body { padding: 20px 24px; max-height: 85vh; overflow-y: auto; }
 
 .form-group {
   margin-bottom: 14px;
@@ -529,7 +528,7 @@ tbody tr:hover { background: var(--bg); }
 .header-actions { display: flex; gap: 8px; align-items: center; }
 
 /* ---- Modal wide ---- */
-.modal-wide { width: 760px; max-width: 96vw; }
+.modal-wide { width: min(1000px, 92vw); }
 
 /* ---- Scan modal ---- */
 .scan-form .form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
@@ -646,7 +645,7 @@ tbody tr:hover { background: var(--bg); }
   gap: 8px;
 }
 .config-section summary::-webkit-details-marker { display: none; }
-.config-section summary::before { content: "&#9654;"; font-size: 10px; transition: transform .2s; }
+.config-section summary::before { content: "\25BA"; font-size: 10px; transition: transform .2s; }
 .config-section[open] summary::before { transform: rotate(90deg); }
 .config-section-body { padding: 14px 16px; }
 
