@@ -114,13 +114,18 @@ async function apiFetch(path, opts = {}) {
 async function refreshDashboard() {
   const container = document.getElementById("switch-cards");
   const summaryEl = document.getElementById("summary-cards");
-  container.innerHTML = `<div class="spinner"></div>`;
+
+  // Only show spinner on first load (container is empty), not on auto-refresh
+  const firstLoad = container.innerHTML.trim() === "";
+  if (firstLoad) container.innerHTML = `<div class="spinner"></div>`;
 
   let data;
   try {
     data = await apiFetch("/dashboard");
   } catch {
-    container.innerHTML = `<div class="empty-state"><h3>Could not load dashboard</h3><p>Is the backend running?</p></div>`;
+    if (firstLoad) {
+      container.innerHTML = `<div class="empty-state"><h3>Could not load dashboard</h3><p>Is the backend running?</p></div>`;
+    }
     return;
   }
 
@@ -293,7 +298,7 @@ async function refreshDetail() {
 
 async function loadOverview(id) {
   const el = document.getElementById("detail-overview");
-  el.innerHTML = `<div class="spinner"></div>`;
+  if (!el.innerHTML.trim()) el.innerHTML = `<div class="spinner"></div>`;
   let data;
   try {
     data = await apiFetch(`/switches/${id}/overview`);
@@ -326,7 +331,7 @@ async function loadOverview(id) {
 
 async function loadPorts(id) {
   const el = document.getElementById("tab-ports");
-  el.innerHTML = `<div class="spinner"></div>`;
+  if (!el.innerHTML.trim()) el.innerHTML = `<div class="spinner"></div>`;
   let ports;
   try {
     ports = await apiFetch(`/switches/${id}/ports`);
@@ -373,7 +378,7 @@ async function loadPorts(id) {
 
 async function loadPoe(id) {
   const el = document.getElementById("tab-poe");
-  el.innerHTML = `<div class="spinner"></div>`;
+  if (!el.innerHTML.trim()) el.innerHTML = `<div class="spinner"></div>`;
   let ports;
   try {
     ports = await apiFetch(`/switches/${id}/poe`);
@@ -409,7 +414,7 @@ async function loadPoe(id) {
 
 async function loadTraffic(id) {
   const el = document.getElementById("tab-traffic");
-  el.innerHTML = `<div class="spinner"></div>`;
+  if (!el.innerHTML.trim()) el.innerHTML = `<div class="spinner"></div>`;
   let ports;
   try {
     ports = await apiFetch(`/switches/${id}/traffic`);
