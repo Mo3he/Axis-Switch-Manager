@@ -1,9 +1,11 @@
 services:
   axis-switch-manager:
     image: ghcr.io/mo3he/axis-switch-manager:latest
-    build: .
     ports:
       - "8000:8000"
     volumes:
-      - ./backend/switches.json:/app/backend/switches.json
+      - switches_data:/app/backend
     restart: unless-stopped
+
+volumes:
+  switches_data:
