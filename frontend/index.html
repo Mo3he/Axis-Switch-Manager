@@ -95,6 +95,38 @@
         <div id="tab-traffic" class="tab-content"></div>
         <div id="tab-configure" class="tab-content"></div>
       </div>
+
+      <!-- Settings View -->
+      <div id="view-settings" class="view">
+        <div class="page-header">
+          <h1>Settings</h1>
+        </div>
+        <div style="max-width:540px">
+          <div class="config-card">
+            <div class="config-card-header"><h3>Auto-Refresh</h3></div>
+            <div class="config-card-body">
+              <div class="form-group">
+                <label>Dashboard refresh interval</label>
+                <div style="display:flex;align-items:center;gap:12px">
+                  <input type="number" id="setting-dash-interval" min="5" max="300" style="width:80px" />
+                  <span style="color:var(--text-muted);font-size:13px">seconds</span>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Switch detail refresh interval</label>
+                <div style="display:flex;align-items:center;gap:12px">
+                  <input type="number" id="setting-detail-interval" min="5" max="300" style="width:80px" />
+                  <span style="color:var(--text-muted);font-size:13px">seconds</span>
+                </div>
+              </div>
+              <div style="margin-top:16px;display:flex;gap:8px">
+                <button class="btn btn-primary" onclick="saveSettings()">Save</button>
+                <button class="btn btn-ghost" onclick="resetSettings()">Reset to defaults</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </main>
   </div>
 
@@ -336,38 +368,6 @@
         <div class="modal-actions" style="margin-top:16px">
           <button class="btn btn-ghost" onclick="closeModal('modal-bulk-config')">Cancel</button>
           <button class="btn btn-primary" onclick="applyBulkConfig()">Apply to Selected</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Settings View -->
-  <div id="view-settings" class="view">
-    <div class="page-header">
-      <h1>Settings</h1>
-    </div>
-    <div style="max-width:540px">
-      <div class="config-card">
-        <div class="config-card-header"><h3>Auto-Refresh</h3></div>
-        <div class="config-card-body">
-          <div class="form-group">
-            <label>Dashboard refresh interval</label>
-            <div style="display:flex;align-items:center;gap:12px">
-              <input type="number" id="setting-dash-interval" min="5" max="300" style="width:80px" />
-              <span style="color:var(--text-muted);font-size:13px">seconds</span>
-            </div>
-          </div>
-          <div class="form-group">
-            <label>Switch detail refresh interval</label>
-            <div style="display:flex;align-items:center;gap:12px">
-              <input type="number" id="setting-detail-interval" min="5" max="300" style="width:80px" />
-              <span style="color:var(--text-muted);font-size:13px">seconds</span>
-            </div>
-          </div>
-          <div style="margin-top:16px;display:flex;gap:8px">
-            <button class="btn btn-primary" onclick="saveSettings()">Save</button>
-            <button class="btn btn-ghost" onclick="resetSettings()">Reset to defaults</button>
-          </div>
         </div>
       </div>
     </div>
