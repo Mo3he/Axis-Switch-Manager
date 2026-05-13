@@ -10,6 +10,37 @@ let previousView = "dashboard";
 let scanResults = [];
 let allSwitches = [];
 
+// Auto-refresh timers
+let _dashTimer = null;
+let _detailTimer = null;
+const DASHBOARD_INTERVAL = 30000;  // 30 s
+const DETAIL_INTERVAL = 15000;     // 15 s
+
+function _startDashTimer() {
+  _stopAllTimers();
+  _dashTimer = setInterval(() => {
+    if (currentView === "dashboard") refreshDashboard();
+  }, DASHBOARD_INTERVAL);
+}
+
+function _startDetailTimer() {
+  _stopAllTimers();
+  _detailTimer = setInterval(() => {
+    if (currentView === "switch-detail" && currentSwitchId) {
+      // Only refresh live-data tabs, not the configure tab
+      loadOverview(currentSwitchId);
+      loadPorts(currentSwitchId);
+      loadPoe(currentSwitchId);
+      loadTraffic(currentSwitchId);
+    }
+  }, DETAIL_INTERVAL);
+}
+
+function _stopAllTimers() {
+  if (_dashTimer) { clearInterval(_dashTimer); _dashTimer = null; }
+  if (_detailTimer) { clearInterval(_detailTimer); _detailTimer = null; }
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -25,15 +56,17 @@ function showView(name) {
 }
 
 function goBack() {
+  _stopAllTimers();
   showView(previousView || "dashboard");
+  if (previousView === "dashboard") { refreshDashboard(); _startDashTimer(); }
 }
 
 document.querySelectorAll(".nav-link").forEach(link => {
   link.addEventListener("click", e => {
     e.preventDefault();
     const view = link.dataset.view;
-    if (view === "dashboard") refreshDashboard();
-    else if (view === "switches") loadSwitchesList();
+    if (view === "dashboard") { refreshDashboard(); _startDashTimer(); }
+    else if (view === "switches") { loadSwitchesList(); _stopAllTimers(); }
     showView(view);
   });
 });
@@ -245,6 +278,7 @@ async function openSwitchDetail(id, name) {
   document.querySelector(".tab[data-tab='ports']").classList.add("active");
   document.getElementById("tab-ports").classList.add("active");
   showView("switch-detail");
+  _startDetailTimer();
   await refreshDetail();
 }
 
@@ -1142,6 +1176,19 @@ function addBulkPortRow() {
   container.appendChild(row);
 }
 
+function addBulkDescRow() {
+  const container = document.getElementById("bulk-desc-rows");
+  const row = document.createElement("div");
+  row.className = "bulk-port-row";
+  row.innerHTML = `
+    <label>Port</label>
+    <input type="number" class="bulk-desc-port" min="1" max="24" placeholder="#" style="width:60px" />
+    <label>Description</label>
+    <input type="text" class="bulk-desc-text" maxlength="47" placeholder="e.g. Camera 1" style="flex:1" />
+    <button type="button" class="btn btn-ghost btn-sm" onclick="this.parentElement.remove()">&#215;</button>`;
+  container.appendChild(row);
+}
+
 async function applyBulkConfig() {
   const checkedIds = [...document.querySelectorAll(".bulk-sw-check:checked")].map(c => c.value);
   if (!checkedIds.length) {
@@ -1177,7 +1224,43 @@ async function applyBulkConfig() {
     };
   }).filter(Boolean);
 
-  if (!systemPayload && !poePorts.length && !portItems.length) {
+  // NTP
+  const ntpMode = document.getElementById("bulk-ntp-mode")?.value;
+  const ntpServer1 = document.getElementById("bulk-ntp-server1")?.value.trim();
+  const ntpServer2 = document.getElementById("bulk-ntp-server2")?.value.trim();
+  const ntpInterval = document.getElementById("bulk-ntp-interval")?.value;
+  const ntpPayload = (ntpMode !== "" && ntpMode != null) || ntpServer1
+    ? {
+        mode: ntpMode !== "" ? parseInt(ntpMode) : 1,
+        interval: parseInt(ntpInterval) || 3600,
+        server1: ntpServer1 || "",
+        server2: ntpServer2 || "",
+        server3: "", server4: "", server5: "",
+      }
+    : null;
+
+  // Loop protection
+  const loopGlobal = document.getElementById("bulk-loop-global")?.value;
+  const loopInterval = document.getElementById("bulk-loop-interval")?.value;
+  const loopShutdown = document.getElementById("bulk-loop-shutdown")?.value;
+  const loopPayload = (loopGlobal !== "" && loopGlobal != null)
+    ? {
+        global_enable: loopGlobal === "true",
+        tx_interval: parseInt(loopInterval) || 5,
+        shutdown_time: parseInt(loopShutdown) || 180,
+        ports: [],
+      }
+    : null;
+
+  // Port descriptions
+  const descItems = [...document.querySelectorAll("#bulk-desc-rows .bulk-port-row")].map(row => {
+    const portNum = parseInt(row.querySelector(".bulk-desc-port")?.value);
+    const desc = row.querySelector(".bulk-desc-text")?.value.trim() || "";
+    if (!portNum || isNaN(portNum)) return null;
+    return { port: portNum, description: desc };
+  }).filter(Boolean);
+
+  if (!systemPayload && !poePorts.length && !portItems.length && !ntpPayload && !loopPayload && !descItems.length) {
     toast("Nothing to configure - fill in at least one field", "error");
     return;
   }
@@ -1187,6 +1270,9 @@ async function applyBulkConfig() {
     system: systemPayload,
     poe: poePorts.length ? { ports: poePorts } : null,
     ports: portItems.length ? { ports: portItems } : null,
+    ntp: ntpPayload,
+    loop: loopPayload,
+    ports_desc: descItems.length ? { ports: descItems } : null,
   };
 
   const progressEl = document.getElementById("bulk-progress");
@@ -1221,3 +1307,4 @@ async function applyBulkConfig() {
 // ---------------------------------------------------------------------------
 
 refreshDashboard();
+_startDashTimer();

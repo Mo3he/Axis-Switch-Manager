@@ -257,6 +257,73 @@
                 <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="addBulkPortRow()">+ Add Port</button>
               </div>
             </details>
+
+            <details class="config-section">
+              <summary>NTP / Time Server</summary>
+              <div class="config-section-body">
+                <p class="hint-text">Apply NTP settings to all selected switches. Leave blank to skip.</p>
+                <div class="form-group">
+                  <label>NTP Mode</label>
+                  <select id="bulk-ntp-mode">
+                    <option value="">— skip —</option>
+                    <option value="1">Enabled</option>
+                    <option value="0">Disabled</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label>Sync Interval (s)</label>
+                  <input type="number" id="bulk-ntp-interval" placeholder="3600" min="60" max="86400" />
+                </div>
+                <div class="form-group">
+                  <label>Primary Server</label>
+                  <input type="text" id="bulk-ntp-server1" placeholder="e.g. ntp.axis.com" />
+                </div>
+                <div class="form-group">
+                  <label>Secondary Server</label>
+                  <input type="text" id="bulk-ntp-server2" placeholder="optional" />
+                </div>
+              </div>
+            </details>
+
+            <details class="config-section">
+              <summary>Loop Protection</summary>
+              <div class="config-section-body">
+                <p class="hint-text">Enable or disable loop protection globally on all selected switches. Leave blank to skip.</p>
+                <div class="form-group">
+                  <label>Global Loop Protection</label>
+                  <select id="bulk-loop-global">
+                    <option value="">— skip —</option>
+                    <option value="true">Enable</option>
+                    <option value="false">Disable</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label>TX Interval (s)</label>
+                  <input type="number" id="bulk-loop-interval" placeholder="5" min="1" max="10" />
+                </div>
+                <div class="form-group">
+                  <label>Shutdown Time (s)</label>
+                  <input type="number" id="bulk-loop-shutdown" placeholder="180" min="0" max="604800" />
+                </div>
+              </div>
+            </details>
+
+            <details class="config-section">
+              <summary>Port Descriptions</summary>
+              <div class="config-section-body">
+                <p class="hint-text">Set a description for specific port numbers on all selected switches.</p>
+                <div id="bulk-desc-rows">
+                  <div class="bulk-port-row">
+                    <label>Port</label>
+                    <input type="number" class="bulk-desc-port" min="1" max="24" placeholder="#" style="width:60px" />
+                    <label>Description</label>
+                    <input type="text" class="bulk-desc-text" maxlength="47" placeholder="e.g. Camera 1" style="flex:1" />
+                    <button type="button" class="btn btn-ghost btn-sm" onclick="this.parentElement.remove()">&#215;</button>
+                  </div>
+                </div>
+                <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="addBulkDescRow()">+ Add Port</button>
+              </div>
+            </details>
           </div>
         </div>
         <div id="bulk-progress" style="display:none">

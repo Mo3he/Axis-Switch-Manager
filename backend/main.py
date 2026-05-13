@@ -736,49 +736,6 @@ async def bulk_add_switches(payload: BulkAddPayload):
 
 
 # ---------------------------------------------------------------------------
-# Bulk config apply - apply same settings to multiple switches
-# ---------------------------------------------------------------------------
-
-class BulkConfigPayload(BaseModel):
-    switch_ids: list[str]
-    system: SystemConfigPayload | None = None
-    poe: PoeConfigPayload | None = None
-    ports: PortsConfigPayload | None = None
-
-
-@app.post("/api/bulk/apply")
-async def bulk_apply(payload: BulkConfigPayload):
-    results = []
-    for sw_id in payload.switch_ids:
-        sw_result = {"id": sw_id, "ok": True, "errors": []}
-        try:
-            sw = _find_switch(sw_id)
-        except HTTPException:
-            results.append({"id": sw_id, "ok": False, "errors": ["Switch not found"]})
-            continue
-        if payload.system:
-            try:
-                await set_system_config(sw_id, payload.system)
-            except Exception as e:
-                sw_result["ok"] = False
-                sw_result["errors"].append(f"system: {e}")
-        if payload.poe:
-            try:
-                await set_poe_config(sw_id, payload.poe)
-            except Exception as e:
-                sw_result["ok"] = False
-                sw_result["errors"].append(f"poe: {e}")
-        if payload.ports:
-            try:
-                await set_ports_config(sw_id, payload.ports)
-            except Exception as e:
-                sw_result["ok"] = False
-                sw_result["errors"].append(f"ports: {e}")
-        results.append(sw_result)
-    return {"results": results}
-
-
-# ---------------------------------------------------------------------------
 # NTP config (GET + POST)
 # ---------------------------------------------------------------------------
 
@@ -1221,6 +1178,71 @@ async def set_ports_speed(switch_id: str, payload: PortsSpeedPayload):
         return {"ok": True}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Bulk config apply - apply same settings to multiple switches
+# (placed after all payload classes are defined)
+# ---------------------------------------------------------------------------
+
+class BulkConfigPayload(BaseModel):
+    switch_ids: list[str]
+    system: SystemConfigPayload | None = None
+    poe: PoeConfigPayload | None = None
+    ports: PortsConfigPayload | None = None
+    ntp: NtpConfigPayload | None = None
+    loop: LoopConfigPayload | None = None
+    ports_desc: PortsDescPayload | None = None
+
+
+@app.post("/api/bulk/apply")
+async def bulk_apply(payload: BulkConfigPayload):
+    results = []
+    for sw_id in payload.switch_ids:
+        sw_result = {"id": sw_id, "ok": True, "errors": []}
+        try:
+            sw = _find_switch(sw_id)
+        except HTTPException:
+            results.append({"id": sw_id, "ok": False, "errors": ["Switch not found"]})
+            continue
+        if payload.system:
+            try:
+                await set_system_config(sw_id, payload.system)
+            except Exception as e:
+                sw_result["ok"] = False
+                sw_result["errors"].append(f"system: {e}")
+        if payload.poe:
+            try:
+                await set_poe_config(sw_id, payload.poe)
+            except Exception as e:
+                sw_result["ok"] = False
+                sw_result["errors"].append(f"poe: {e}")
+        if payload.ports:
+            try:
+                await set_ports_config(sw_id, payload.ports)
+            except Exception as e:
+                sw_result["ok"] = False
+                sw_result["errors"].append(f"ports: {e}")
+        if payload.ntp:
+            try:
+                await set_ntp_config(sw_id, payload.ntp)
+            except Exception as e:
+                sw_result["ok"] = False
+                sw_result["errors"].append(f"ntp: {e}")
+        if payload.loop:
+            try:
+                await set_loop_config(sw_id, payload.loop)
+            except Exception as e:
+                sw_result["ok"] = False
+                sw_result["errors"].append(f"loop: {e}")
+        if payload.ports_desc:
+            try:
+                await set_ports_desc(sw_id, payload.ports_desc)
+            except Exception as e:
+                sw_result["ok"] = False
+                sw_result["errors"].append(f"ports_desc: {e}")
+        results.append(sw_result)
+    return {"results": results}
 
 
 # ---------------------------------------------------------------------------
