@@ -76,6 +76,7 @@ document.querySelectorAll(".nav-link").forEach(link => {
     const view = link.dataset.view;
     if (view === "dashboard") { refreshDashboard(); _startDashTimer(); }
     else if (view === "switches") { loadSwitchesList(); _stopAllTimers(); }
+    else if (view === "topology") { loadTopologyView(); _stopAllTimers(); }
     else if (view === "settings") { loadSettingsView(); _stopAllTimers(); }
     showView(view);
   });
@@ -484,9 +485,9 @@ async function loadConfigTab(id) {
   const el = document.getElementById("tab-configure");
   el.innerHTML = `<div class="spinner"></div>`;
 
-  let sysConf, poeConf, portConf, ntpConf, portDesc, loopConf, vlanConf, pvlanConf, aggrConf;
+  let sysConf, poeConf, portConf, ntpConf, portDesc, loopConf, vlanConf, pvlanConf, aggrConf, snmpConf;
   try {
-    [sysConf, poeConf, portConf, ntpConf, portDesc, loopConf, vlanConf, pvlanConf, aggrConf] = await Promise.all([
+    [sysConf, poeConf, portConf, ntpConf, portDesc, loopConf, vlanConf, pvlanConf, aggrConf, snmpConf] = await Promise.all([
       apiFetch(`/switches/${id}/config/system`),
       apiFetch(`/switches/${id}/config/poe`),
       apiFetch(`/switches/${id}/ports`),
@@ -496,6 +497,7 @@ async function loadConfigTab(id) {
       apiFetch(`/switches/${id}/config/vlan`),
       apiFetch(`/switches/${id}/config/pvlan`),
       apiFetch(`/switches/${id}/config/aggregation`),
+      apiFetch(`/switches/${id}/config/snmp`),
     ]);
   } catch {
     el.innerHTML = `<div class="empty-state"><h3>Could not load configuration</h3></div>`;
@@ -504,7 +506,7 @@ async function loadConfigTab(id) {
 
   _cfgPortsCache = portConf;
   _cfgPoeCache = poeConf.ports || [];
-  _cfgAllData = { sysConf, poeConf, portConf, ntpConf, portDesc, loopConf, vlanConf, pvlanConf, aggrConf };
+  _cfgAllData = { sysConf, poeConf, portConf, ntpConf, portDesc, loopConf, vlanConf, pvlanConf, aggrConf, snmpConf };
 
   const descByPort = Object.fromEntries((portDesc || []).map(p => [p.port, p.description]));
   const loopByPort = Object.fromEntries((loopConf.ports || []).map(p => [p.port, p]));
@@ -798,6 +800,38 @@ async function loadConfigTab(id) {
         </div>
       </details>` : ''}
 
+      <!-- SNMP -->
+      <details class="cfg-panel">
+        <summary>SNMP</summary>
+        <div class="cfg-panel-body">
+          <div class="cfg-two-col">
+            <div class="form-group">
+              <label>SNMP</label>
+              <select id="cfg-snmp-enabled">
+                <option value="1" ${snmpConf.enabled ? 'selected' : ''}>Enabled</option>
+                <option value="0" ${!snmpConf.enabled ? 'selected' : ''}>Disabled</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Version</label>
+              <select id="cfg-snmp-version">
+                <option value="1" ${snmpConf.version === 1 ? 'selected' : ''}>SNMPv1</option>
+                <option value="2" ${snmpConf.version === 2 ? 'selected' : ''}>SNMPv2c</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Community String (read)</label>
+              <input type="text" id="cfg-snmp-community" value="${escHtml(snmpConf.community_ro || 'public')}" maxlength="32" placeholder="public" />
+            </div>
+            <div class="form-group">
+              <label>Trap Host</label>
+              <input type="text" id="cfg-snmp-trap" value="${escHtml(snmpConf.trap_host || '')}" placeholder="IP or hostname (optional)" />
+            </div>
+          </div>
+          <div class="cfg-actions"><button class="btn btn-primary btn-sm" onclick="saveSnmpConfig('${id}')">Save SNMP</button></div>
+        </div>
+      </details>
+
     </div>`;
 }
 
@@ -901,10 +935,22 @@ async function saveLoopConfig(id) {
   } catch { /* error already toasted */ }
 }
 
+async function saveSnmpConfig(id) {
+  const payload = {
+    enabled: document.getElementById("cfg-snmp-enabled")?.value === "1",
+    version: parseInt(document.getElementById("cfg-snmp-version")?.value) || 1,
+    community_ro: document.getElementById("cfg-snmp-community")?.value.trim() || "public",
+    trap_host: document.getElementById("cfg-snmp-trap")?.value.trim() || "",
+  };
+  try {
+    await apiFetch(`/switches/${id}/config/snmp`, { method: "POST", body: JSON.stringify(payload) });
+    toast("SNMP configuration saved", "success");
+  } catch { /* error already toasted */ }
+}
+
 async function saveVlanConfig(id) {
   const ports = (_cfgAllData.vlanConf?.ports || []).map(p => ({
     port: p.port,
-    mode: parseInt(document.getElementById(`vlan-mode-${p.port}`)?.value ?? p.mode),
     pvid: parseInt(document.getElementById(`vlan-pvid-${p.port}`)?.value ?? p.pvid),
     frame_type: parseInt(document.getElementById(`vlan-frame-${p.port}`)?.value ?? p.frame_type),
     ingress_filter: document.getElementById(`vlan-ingress-${p.port}`)?.checked ?? p.ingress_filter,
@@ -1277,7 +1323,18 @@ async function applyBulkConfig() {
     return { port: portNum, description: desc };
   }).filter(Boolean);
 
-  if (!systemPayload && !poePorts.length && !portItems.length && !ntpPayload && !loopPayload && !descItems.length) {
+  // SNMP
+  const snmpMode = document.getElementById("bulk-snmp-enabled")?.value;
+  const snmpPayload = snmpMode !== ""
+    ? {
+        enabled: snmpMode === "1",
+        version: parseInt(document.getElementById("bulk-snmp-version")?.value) || 1,
+        community_ro: document.getElementById("bulk-snmp-community")?.value.trim() || "public",
+        trap_host: document.getElementById("bulk-snmp-trap")?.value.trim() || "",
+      }
+    : null;
+
+  if (!systemPayload && !poePorts.length && !portItems.length && !ntpPayload && !loopPayload && !descItems.length && !snmpPayload) {
     toast("Nothing to configure - fill in at least one field", "error");
     return;
   }
@@ -1290,6 +1347,7 @@ async function applyBulkConfig() {
     ntp: ntpPayload,
     loop: loopPayload,
     ports_desc: descItems.length ? { ports: descItems } : null,
+    snmp: snmpPayload,
   };
 
   const progressEl = document.getElementById("bulk-progress");
@@ -1318,6 +1376,287 @@ async function applyBulkConfig() {
     progressEl.style.display = "none";
   }
 }
+
+// ---------------------------------------------------------------------------
+// Network Topology
+// ---------------------------------------------------------------------------
+
+let _topoGraph = null;
+
+async function loadTopologyView() {
+  const statusEl = document.getElementById("topology-status");
+  const canvas   = document.getElementById("topology-canvas");
+
+  if (_topoGraph) { _topoGraph.destroy(); _topoGraph = null; }
+
+  statusEl.textContent = "Loading topology data via SNMP / LLDP…";
+  canvas.style.opacity = "0.3";
+
+  let data;
+  try {
+    data = await apiFetch("/topology");
+  } catch {
+    statusEl.textContent = "Failed to load topology data.";
+    canvas.style.opacity = "1";
+    return;
+  }
+
+  canvas.style.opacity = "1";
+  const { nodes, edges, snmp_status } = data;
+
+  // Build human-readable status line
+  const noLldp  = Object.values(snmp_status).filter(s => s === "no_lldp").length;
+  const errored = Object.values(snmp_status).filter(s => s.startsWith("error")).length;
+  const msgs = [];
+  if (noLldp)  msgs.push(`${noLldp} switch${noLldp  > 1 ? "es" : ""} returned no LLDP data (SNMP or LLDP may be disabled)`);
+  if (errored) msgs.push(`${errored} switch${errored > 1 ? "es" : ""} unreachable via SNMP`);
+  if (!edges.length && !msgs.length) msgs.push("No connections found — make sure SNMP is enabled on each switch");
+  statusEl.textContent = msgs.length ? msgs.join("  ·  ") : `${nodes.length} device${nodes.length !== 1 ? "s" : ""}, ${edges.length} link${edges.length !== 1 ? "s" : ""}`;
+
+  if (!nodes.length) { statusEl.textContent = "No switches configured."; return; }
+
+  _topoGraph = new ForceGraph(canvas, nodes, edges);
+}
+
+
+class ForceGraph {
+  constructor(canvas, nodes, edges) {
+    this.canvas = canvas;
+    this.ctx    = canvas.getContext("2d");
+
+    // Size canvas pixels to its CSS layout size
+    const rect = canvas.getBoundingClientRect();
+    canvas.width  = rect.width  || 900;
+    canvas.height = rect.height || 520;
+
+    const W = canvas.width, H = canvas.height;
+    const cx = W / 2, cy = H / 2;
+
+    // Place nodes in a circle for initial layout
+    this.nodes = nodes.map((n, i) => {
+      const angle = (2 * Math.PI * i) / nodes.length;
+      const r = Math.min(W, H) * 0.28;
+      return { ...n, x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle), vx: 0, vy: 0, fixed: false };
+    });
+    this.nodeById = Object.fromEntries(this.nodes.map(n => [n.id, n]));
+    this.edges    = edges;
+
+    this.dragging = null;
+    this.hovering = null;
+    this._animId  = null;
+    this._alpha   = 1.0;
+
+    // Pre-settle physics before first paint
+    for (let i = 0; i < 200; i++) this._tick(0.9);
+
+    this._setupEvents();
+    this._animate();
+
+    this._onResize = () => {
+      const r = canvas.getBoundingClientRect();
+      canvas.width  = r.width;
+      canvas.height = r.height;
+    };
+    window.addEventListener("resize", this._onResize);
+  }
+
+  _tick(alpha) {
+    const nodes = this.nodes;
+    const W = this.canvas.width, H = this.canvas.height;
+    const cx = W / 2, cy = H / 2;
+    const REPULSION  = 5000;
+    const SPRING_LEN = 190;
+    const SPRING_K   = 0.035;
+    const GRAVITY    = 0.022;
+    const DAMPING    = 0.72;
+
+    for (const n of nodes) { n.fx = 0; n.fy = 0; }
+
+    // Gravity toward centre
+    for (const n of nodes) {
+      n.fx += (cx - n.x) * GRAVITY;
+      n.fy += (cy - n.y) * GRAVITY;
+    }
+
+    // Node-node repulsion (O(n²) — fine for ≤100 nodes)
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const dx = nodes[j].x - nodes[i].x;
+        const dy = nodes[j].y - nodes[i].y;
+        const d2 = dx * dx + dy * dy || 1;
+        const d  = Math.sqrt(d2);
+        const f  = REPULSION / d2;
+        const fx = (dx / d) * f, fy = (dy / d) * f;
+        nodes[i].fx -= fx; nodes[i].fy -= fy;
+        nodes[j].fx += fx; nodes[j].fy += fy;
+      }
+    }
+
+    // Spring forces along edges
+    for (const e of this.edges) {
+      const s = this.nodeById[e.source], t = this.nodeById[e.target];
+      if (!s || !t) continue;
+      const dx = t.x - s.x, dy = t.y - s.y;
+      const d  = Math.sqrt(dx * dx + dy * dy) || 1;
+      const f  = (d - SPRING_LEN) * SPRING_K;
+      const fx = (dx / d) * f, fy = (dy / d) * f;
+      s.fx += fx; s.fy += fy;
+      t.fx -= fx; t.fy -= fy;
+    }
+
+    // Soft boundary walls
+    const PAD = 80;
+    for (const n of nodes) {
+      if (n.x < PAD)         n.fx += (PAD - n.x) * 0.4;
+      if (n.x > W - PAD)     n.fx += (W - PAD - n.x) * 0.4;
+      if (n.y < PAD)         n.fy += (PAD - n.y) * 0.4;
+      if (n.y > H - PAD)     n.fy += (H - PAD - n.y) * 0.4;
+    }
+
+    // Integrate
+    for (const n of nodes) {
+      if (n.fixed) continue;
+      n.vx = (n.vx + n.fx * alpha) * DAMPING;
+      n.vy = (n.vy + n.fy * alpha) * DAMPING;
+      n.x += n.vx;
+      n.y += n.vy;
+    }
+  }
+
+  _draw() {
+    const ctx = this.ctx;
+    const W = this.canvas.width, H = this.canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    // Subtle grid
+    ctx.strokeStyle = "#f1f5f9";
+    ctx.lineWidth = 1;
+    for (let x = 0; x < W; x += 44) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+    for (let y = 0; y < H; y += 44) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+    // Edges
+    for (const e of this.edges) {
+      const s = this.nodeById[e.source], t = this.nodeById[e.target];
+      if (!s || !t) continue;
+      const hov = this.hovering && (this.hovering.id === e.source || this.hovering.id === e.target);
+      const dx = t.x - s.x, dy = t.y - s.y;
+      const len = Math.sqrt(dx * dx + dy * dy) || 1;
+      const ux = dx / len, uy = dy / len;
+
+      ctx.beginPath();
+      ctx.moveTo(s.x, s.y);
+      ctx.lineTo(t.x, t.y);
+      ctx.strokeStyle = hov ? "#0063a3" : "#cbd5e1";
+      ctx.lineWidth   = hov ? 2.5 : 1.5;
+      ctx.stroke();
+
+      // Port labels (near each endpoint)
+      ctx.font = "bold 10px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      const OFFSET = 42;
+      if (e.source_port) {
+        ctx.fillStyle = hov ? "#0063a3" : "#64748b";
+        ctx.fillText(`P${e.source_port}`, s.x + ux * OFFSET, s.y + uy * OFFSET - 6);
+      }
+      if (e.target_port) {
+        const lbl = String(e.target_port).length <= 6 ? `P${e.target_port}` : String(e.target_port).slice(0, 8);
+        ctx.fillStyle = hov ? "#0063a3" : "#64748b";
+        ctx.fillText(lbl, t.x - ux * OFFSET, t.y - uy * OFFSET - 6);
+      }
+    }
+
+    // Nodes
+    const R = 34;
+    for (const n of this.nodes) {
+      const hov = this.hovering === n;
+      ctx.shadowColor = "rgba(0,0,0,0.18)";
+      ctx.shadowBlur  = hov ? 18 : 8;
+
+      // Circle
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, R, 0, Math.PI * 2);
+      ctx.fillStyle   = n.managed ? "#0063a3" : "#94a3b8";
+      ctx.fill();
+      ctx.strokeStyle = hov ? "#bfdbfe" : "#ffffff";
+      ctx.lineWidth   = hov ? 3 : 2;
+      ctx.stroke();
+      ctx.shadowBlur  = 0;
+
+      // Switch icon: 3 horizontal bars + 2 dots (like sidebar logo)
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      for (let row = 0; row < 3; row++) {
+        const barY = n.y - 8 + row * 6;
+        ctx.fillRect(n.x - 11, barY, 22, 2.5);
+      }
+      ctx.fillStyle = n.managed ? "#7dd3fc" : "#e2e8f0";
+      ctx.beginPath(); ctx.arc(n.x - 9, n.y - 7, 2.2, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(n.x - 9, n.y - 1, 2.2, 0, Math.PI * 2); ctx.fill();
+
+      // Name label
+      ctx.fillStyle = "#1e293b";
+      ctx.font = `${hov ? "bold " : ""}12px system-ui, sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      let label = n.name;
+      if (label.length > 22) label = label.slice(0, 20) + "…";
+      ctx.fillText(label, n.x, n.y + R + 5, 150);
+
+      if (n.ip) {
+        ctx.fillStyle = "#64748b";
+        ctx.font = "10px system-ui, sans-serif";
+        ctx.fillText(n.ip, n.x, n.y + R + 21, 150);
+      }
+      ctx.textBaseline = "alphabetic";
+    }
+  }
+
+  _animate() {
+    this._animId = requestAnimationFrame(() => {
+      if (this._alpha > 0.005 || this.dragging) {
+        this._tick(Math.max(this._alpha, this.dragging ? 0.15 : 0));
+        this._alpha *= 0.97;
+      }
+      this._draw();
+      this._animate();
+    });
+  }
+
+  _nodeAt(x, y) {
+    for (const n of this.nodes) {
+      const dx = n.x - x, dy = n.y - y;
+      if (dx * dx + dy * dy <= 34 * 34) return n;
+    }
+    return null;
+  }
+
+  _setupEvents() {
+    const c = this.canvas;
+    c.addEventListener("mousedown", e => {
+      const r = c.getBoundingClientRect();
+      const n = this._nodeAt(e.clientX - r.left, e.clientY - r.top);
+      if (n) { this.dragging = n; n.fixed = true; this._alpha = 0.4; c.style.cursor = "grabbing"; }
+    });
+    c.addEventListener("mousemove", e => {
+      const r = c.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      if (this.dragging) { this.dragging.x = x; this.dragging.y = y; }
+      else { this.hovering = this._nodeAt(x, y); c.style.cursor = this.hovering ? "pointer" : "grab"; }
+    });
+    c.addEventListener("mouseup", () => {
+      if (this.dragging) { this.dragging.fixed = false; this.dragging = null; c.style.cursor = "grab"; }
+    });
+    c.addEventListener("mouseleave", () => {
+      if (this.dragging) { this.dragging.fixed = false; this.dragging = null; }
+      this.hovering = null;
+    });
+  }
+
+  destroy() {
+    cancelAnimationFrame(this._animId);
+    window.removeEventListener("resize", this._onResize);
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // Settings

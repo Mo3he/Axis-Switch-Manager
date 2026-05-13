@@ -770,3 +770,49 @@ select.priority-sel {
 
 .cfg-actions { margin-top: 16px; display: flex; gap: 8px; }
 
+/* ---- Network Topology ---- */
+#topology-container {
+  width: 100%;
+  height: calc(100vh - 230px);
+  min-height: 420px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  position: relative;
+}
+
+#topology-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+#topology-canvas:active { cursor: grabbing; }
+
+.topology-legend {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--text);
+  flex-wrap: wrap;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-dot {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px #cbd5e1;
+}
+.legend-dot.managed   { background: #0063a3; }
+.legend-dot.unmanaged { background: #94a3b8; }
+

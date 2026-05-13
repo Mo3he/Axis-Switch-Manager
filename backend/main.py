@@ -1181,6 +1181,95 @@ async def set_ports_speed(switch_id: str, payload: PortsSpeedPayload):
 
 
 # ---------------------------------------------------------------------------
+# SNMP config (GET + POST)
+# ---------------------------------------------------------------------------
+
+def parse_snmp(raw: str) -> dict:
+    """
+    Parse config/snmp response.
+    Format: mode,version,trap_host|community_entry|trap_entry
+    Example: 1,1,None|,1/1/public/write/800000e53...|0/0/public//::/1/1/0/1/5/1//None
+    """
+    if not raw:
+        return {"enabled": False, "version": 1, "community_ro": "public", "trap_host": ""}
+    raw = raw.strip().rstrip("%")
+    parts = raw.split("|")
+
+    # Global section: mode,version,trap_host
+    global_fields = parts[0].split(",") if parts else []
+    enabled = global_fields[0] == "1" if global_fields else False
+    version = int(global_fields[1]) if len(global_fields) > 1 and global_fields[1].isdigit() else 1
+    trap_host_raw = global_fields[2] if len(global_fields) > 2 else "None"
+    trap_host = "" if trap_host_raw == "None" else trap_host_raw
+
+    # Community string: first non-empty entry after global
+    community_ro = "public"
+    for entry in parts[1:]:
+        stripped = entry.lstrip(",")
+        fields = stripped.split("/")
+        if len(fields) >= 3 and fields[2]:
+            community_ro = fields[2]
+            break
+
+    return {
+        "enabled": enabled,
+        "version": version,
+        "community_ro": community_ro,
+        "trap_host": trap_host,
+        "_raw": raw,
+    }
+
+
+@app.get("/api/switches/{switch_id}/config/snmp")
+async def get_snmp_config(switch_id: str):
+    sw = _find_switch(switch_id)
+    raw = await _fetch(sw, "config/snmp")
+    return parse_snmp(raw)
+
+
+class SnmpConfigPayload(BaseModel):
+    enabled: bool = True
+    version: int = 1           # 1 = SNMPv1, 2 = SNMPv2c
+    community_ro: str = "public"
+    trap_host: str = ""
+
+
+@app.post("/api/switches/{switch_id}/config/snmp")
+async def set_snmp_config(switch_id: str, payload: SnmpConfigPayload):
+    sw = _find_switch(switch_id)
+    # Fetch current raw to preserve all existing entries
+    raw = await _fetch(sw, "config/snmp")
+    raw = raw.strip().rstrip("%")
+    parts = raw.split("|")
+
+    # Rebuild global section
+    global_fields = parts[0].split(",") if parts else ["1", "1", "None"]
+    while len(global_fields) < 3:
+        global_fields.append("None")
+    global_fields[0] = "1" if payload.enabled else "0"
+    global_fields[1] = str(payload.version)
+    global_fields[2] = payload.trap_host if payload.trap_host else "None"
+
+    # Update community string in all community entries
+    new_parts = [",".join(global_fields)]
+    for entry in parts[1:]:
+        prefix = "," if entry.startswith(",") else ""
+        stripped = entry.lstrip(",")
+        fields = stripped.split("/")
+        if len(fields) >= 3 and fields[2]:
+            fields[2] = payload.community_ro
+        new_parts.append(prefix + "/".join(fields))
+
+    new_raw = "|".join(new_parts)
+    client = await _get_client(sw)
+    try:
+        await client.post("/config/snmp", data={"snmpData": new_raw})
+        return {"ok": True}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Bulk config apply - apply same settings to multiple switches
 # (placed after all payload classes are defined)
 # ---------------------------------------------------------------------------
@@ -1193,6 +1282,7 @@ class BulkConfigPayload(BaseModel):
     ntp: NtpConfigPayload | None = None
     loop: LoopConfigPayload | None = None
     ports_desc: PortsDescPayload | None = None
+    snmp: SnmpConfigPayload | None = None
 
 
 @app.post("/api/bulk/apply")
@@ -1241,8 +1331,195 @@ async def bulk_apply(payload: BulkConfigPayload):
             except Exception as e:
                 sw_result["ok"] = False
                 sw_result["errors"].append(f"ports_desc: {e}")
+        if payload.snmp:
+            try:
+                await set_snmp_config(sw_id, payload.snmp)
+            except Exception as e:
+                sw_result["ok"] = False
+                sw_result["errors"].append(f"snmp: {e}")
         results.append(sw_result)
     return {"results": results}
+
+
+# ---------------------------------------------------------------------------
+# SNMP / LLDP Topology
+# ---------------------------------------------------------------------------
+
+LLDP_REM_SYS_NAME  = "1.0.8802.1.1.2.1.4.1.1.9"
+LLDP_REM_PORT_ID   = "1.0.8802.1.1.2.1.4.1.1.7"
+LLDP_REM_PORT_DESC = "1.0.8802.1.1.2.1.4.1.1.8"
+
+
+async def _snmp_walk(host: str, community: str, base_oid: str) -> list[tuple[str, str]]:
+    """SNMP v2c walk. Supports pysnmp v6 (async) and v4 (sync via thread)."""
+    # --- pysnmp v6 lextudio (async API) ---
+    try:
+        from pysnmp.hlapi.v3arch.asyncio import (  # type: ignore
+            SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
+            ObjectType, ObjectIdentity, nextCmd,
+        )
+        engine = SnmpEngine()
+        transport = await UdpTransportTarget.create((host, 161), timeout=3, retries=1)
+        results: list[tuple[str, str]] = []
+        async for err_ind, err_status, _, var_binds in nextCmd(
+            engine,
+            CommunityData(community, mpModel=1),
+            transport,
+            ContextData(),
+            ObjectType(ObjectIdentity(base_oid)),
+            lexicographicMode=False,
+        ):
+            if err_ind or err_status:
+                break
+            for oid, val in var_binds:
+                results.append((str(oid), val.prettyPrint()))
+        return results
+    except (ImportError, AttributeError):
+        pass
+
+    # --- pysnmp v4 (synchronous, run in thread) ---
+    def _sync_walk() -> list[tuple[str, str]]:
+        from pysnmp.hlapi import (  # type: ignore
+            SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
+            ObjectType, ObjectIdentity, nextCmd,
+        )
+        res: list[tuple[str, str]] = []
+        for err_ind, err_status, _, var_binds in nextCmd(
+            SnmpEngine(),
+            CommunityData(community, mpModel=1),
+            UdpTransportTarget((host, 161), timeout=3, retries=1),
+            ContextData(),
+            ObjectType(ObjectIdentity(base_oid)),
+            lexicographicMode=False,
+        ):
+            if err_ind or err_status:
+                break
+            for oid, val in var_binds:
+                res.append((str(oid), val.prettyPrint()))
+        return res
+
+    try:
+        return await asyncio.to_thread(_sync_walk)
+    except Exception:
+        return []
+
+
+def _lldp_index(oid_str: str, base_oid: str) -> tuple[int, int, int]:
+    """Extract (timeMark, localPort, remIdx) from a LLDP OID string."""
+    suffix = oid_str[len(base_oid):].lstrip(".")
+    parts = suffix.split(".")
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2])
+    except (IndexError, ValueError):
+        return 0, 0, 0
+
+
+async def _get_lldp_neighbors(sw: dict) -> list[dict]:
+    """Return LLDP neighbor list for one switch via SNMP."""
+    try:
+        raw = await _fetch(sw, "config/snmp")
+        snmp_conf = parse_snmp(raw)
+    except Exception:
+        snmp_conf = {"enabled": False, "community_ro": "public"}
+
+    if not snmp_conf.get("enabled"):
+        return []
+
+    community = snmp_conf.get("community_ro", "public") or "public"
+    host = sw["ip"]
+
+    sys_names_res, port_ids_res, port_desc_res = await asyncio.gather(
+        _snmp_walk(host, community, LLDP_REM_SYS_NAME),
+        _snmp_walk(host, community, LLDP_REM_PORT_ID),
+        _snmp_walk(host, community, LLDP_REM_PORT_DESC),
+        return_exceptions=True,
+    )
+
+    sys_name_map:  dict[tuple, str] = {}
+    port_id_map:   dict[tuple, str] = {}
+    port_desc_map: dict[tuple, str] = {}
+
+    if not isinstance(sys_names_res, Exception):
+        for oid, val in sys_names_res:
+            sys_name_map[_lldp_index(oid, LLDP_REM_SYS_NAME)] = val
+    if not isinstance(port_ids_res, Exception):
+        for oid, val in port_ids_res:
+            port_id_map[_lldp_index(oid, LLDP_REM_PORT_ID)] = val
+    if not isinstance(port_desc_res, Exception):
+        for oid, val in port_desc_res:
+            port_desc_map[_lldp_index(oid, LLDP_REM_PORT_DESC)] = val
+
+    neighbors = []
+    for key, sys_name in sys_name_map.items():
+        if not sys_name or sys_name.strip().lower() in ("", "noname"):
+            continue
+        _, local_port, _ = key
+        neighbors.append({
+            "local_port": local_port,
+            "remote_sys_name": sys_name.strip(),
+            "remote_port_id": port_id_map.get(key, ""),
+            "remote_port_desc": port_desc_map.get(key, ""),
+        })
+    return neighbors
+
+
+@app.get("/api/topology")
+async def get_topology():
+    """Build network topology graph using LLDP data collected via SNMP."""
+    switches = load_switches()
+    nodes = [
+        {"id": sw["id"], "name": sw["name"], "ip": sw["ip"], "managed": True}
+        for sw in switches
+    ]
+    name_lower_to_id = {sw["name"].lower(): sw["id"] for sw in switches}
+
+    # Query all switches in parallel
+    all_neighbors = await asyncio.gather(
+        *[_get_lldp_neighbors(sw) for sw in switches],
+        return_exceptions=True,
+    )
+
+    extra_nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+    seen_edge_keys: set[tuple] = set()
+    snmp_status: dict[str, str] = {}
+
+    for sw, neighbors in zip(switches, all_neighbors):
+        if isinstance(neighbors, Exception):
+            snmp_status[sw["id"]] = f"error: {neighbors}"
+            continue
+        if not neighbors:
+            snmp_status[sw["id"]] = "no_lldp"
+            continue
+        snmp_status[sw["id"]] = "ok"
+        for nb in neighbors:
+            remote_name = nb["remote_sys_name"]
+            remote_id = name_lower_to_id.get(remote_name.lower())
+            if not remote_id:
+                if remote_name not in extra_nodes:
+                    extra_nodes[remote_name] = {
+                        "id": f"ext:{remote_name}",
+                        "name": remote_name,
+                        "ip": "",
+                        "managed": False,
+                    }
+                remote_id = f"ext:{remote_name}"
+
+            edge_key = tuple(sorted([sw["id"], remote_id]))
+            if edge_key not in seen_edge_keys:
+                seen_edge_keys.add(edge_key)
+                edges.append({
+                    "source": sw["id"],
+                    "target": remote_id,
+                    "source_port": nb["local_port"],
+                    "target_port": nb["remote_port_desc"] or nb["remote_port_id"],
+                })
+
+    return {
+        "nodes": nodes + list(extra_nodes.values()),
+        "edges": edges,
+        "snmp_status": snmp_status,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,9 @@
         <li><a href="#" class="nav-link" data-view="switches">
           <span class="icon">&#9881;</span> Switches
         </a></li>
+        <li><a href="#" class="nav-link" data-view="topology">
+          <span class="icon">&#9672;</span> Topology
+        </a></li>
         <li><a href="#" class="nav-link" data-view="settings">
           <span class="icon">&#9965;</span> Settings
         </a></li>
@@ -125,6 +128,23 @@
               </div>
             </div>
           </div>
+        </div>
+      </div>
+
+      <!-- Topology View -->
+      <div id="view-topology" class="view">
+        <div class="page-header">
+          <h1>Network Topology</h1>
+          <button class="btn btn-ghost" onclick="loadTopologyView()">&#8635; Refresh</button>
+        </div>
+        <div id="topology-status" class="hint-text" style="margin-bottom:8px"></div>
+        <div id="topology-container">
+          <canvas id="topology-canvas"></canvas>
+        </div>
+        <div class="topology-legend">
+          <span class="legend-item"><span class="legend-dot managed"></span> Managed Switch</span>
+          <span class="legend-item"><span class="legend-dot unmanaged"></span> Discovered Device</span>
+          <span class="legend-item" style="color:var(--text-muted);font-size:12px">Drag nodes to rearrange</span>
         </div>
       </div>
     </main>
@@ -357,6 +377,36 @@
                   </div>
                 </div>
                 <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="addBulkDescRow()">+ Add Port</button>
+              </div>
+            </details>
+
+            <details class="config-section">
+              <summary>SNMP</summary>
+              <div class="config-section-body">
+                <p class="hint-text">Configure SNMP on all selected switches. Leave mode on "— skip —" to leave SNMP settings unchanged.</p>
+                <div class="form-group">
+                  <label>SNMP Mode</label>
+                  <select id="bulk-snmp-enabled">
+                    <option value="">— skip —</option>
+                    <option value="1">Enable</option>
+                    <option value="0">Disable</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label>Version</label>
+                  <select id="bulk-snmp-version">
+                    <option value="1">SNMPv1</option>
+                    <option value="2">SNMPv2c</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label>Community String (read)</label>
+                  <input type="text" id="bulk-snmp-community" placeholder="e.g. public" maxlength="32" />
+                </div>
+                <div class="form-group">
+                  <label>Trap Host</label>
+                  <input type="text" id="bulk-snmp-trap" placeholder="IP or hostname (optional)" />
+                </div>
               </div>
             </details>
           </div>
