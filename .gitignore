@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+/tmp/
+
+# Secrets - switches.json contains credentials, keep out of git
+backend/switches.json
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
+
+# PDFs (vendor docs, not source code)
+*.pdf

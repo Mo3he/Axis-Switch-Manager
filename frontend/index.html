@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Axis Switch Manager</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <nav class="sidebar">
+      <div class="sidebar-logo">
+        <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+          <rect width="32" height="32" rx="6" fill="#0069B4"/>
+          <rect x="6" y="10" width="20" height="3" rx="1.5" fill="white"/>
+          <rect x="6" y="15" width="20" height="3" rx="1.5" fill="white"/>
+          <rect x="6" y="20" width="20" height="3" rx="1.5" fill="white"/>
+          <circle cx="8" cy="11.5" r="1.5" fill="#00C4A7"/>
+          <circle cx="8" cy="16.5" r="1.5" fill="#00C4A7"/>
+          <circle cx="8" cy="21.5" r="1.5" fill="rgba(255,255,255,0.4)"/>
+        </svg>
+        <span>Axis Switch Manager</span>
+      </div>
+      <ul class="nav-links">
+        <li><a href="#" class="nav-link active" data-view="dashboard">
+          <span class="icon">&#9783;</span> Dashboard
+        </a></li>
+        <li><a href="#" class="nav-link" data-view="switches">
+          <span class="icon">&#9881;</span> Switches
+        </a></li>
+      </ul>
+      <div class="sidebar-footer">
+        <span id="status-indicator" class="status-dot online"></span>
+        <span id="status-text">Connected</span>
+      </div>
+    </nav>
+
+    <main class="main-content">
+      <!-- Dashboard View -->
+      <div id="view-dashboard" class="view active">
+        <div class="page-header">
+          <h1>Dashboard</h1>
+          <button class="btn btn-primary" onclick="refreshDashboard()">
+            &#8635; Refresh
+          </button>
+        </div>
+
+        <div id="summary-cards" class="summary-cards"></div>
+        <div id="switch-cards" class="switch-cards"></div>
+      </div>
+
+      <!-- Switches View -->
+      <div id="view-switches" class="view">
+        <div class="page-header">
+          <h1>Switches</h1>
+          <div class="header-actions">
+            <button class="btn btn-ghost" onclick="openScanModal()">
+              &#128269; Scan Network
+            </button>
+            <button class="btn btn-ghost" onclick="openBulkConfigModal()">
+              &#9776; Bulk Configure
+            </button>
+            <button class="btn btn-primary" onclick="openAddSwitchModal()">
+              + Add Switch
+            </button>
+          </div>
+        </div>
+        <div id="switches-list" class="table-container"></div>
+      </div>
+
+      <!-- Switch Detail View -->
+      <div id="view-switch-detail" class="view">
+        <div class="page-header">
+          <button class="btn btn-ghost" onclick="goBack()">&#8592; Back</button>
+          <h1 id="detail-title">Switch Detail</h1>
+          <button class="btn btn-primary" onclick="refreshDetail()">
+            &#8635; Refresh
+          </button>
+        </div>
+
+        <div id="detail-overview" class="detail-overview"></div>
+
+        <div class="tabs">
+          <button class="tab active" data-tab="ports" onclick="switchTab(this,'ports')">Ports</button>
+          <button class="tab" data-tab="poe" onclick="switchTab(this,'poe')">PoE</button>
+          <button class="tab" data-tab="traffic" onclick="switchTab(this,'traffic')">Traffic</button>
+          <button class="tab" data-tab="configure" onclick="switchTab(this,'configure')">Configure</button>
+        </div>
+
+        <div id="tab-ports" class="tab-content active"></div>
+        <div id="tab-poe" class="tab-content"></div>
+        <div id="tab-traffic" class="tab-content"></div>
+        <div id="tab-configure" class="tab-content"></div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Add/Edit Switch Modal -->
+  <div id="modal-switch" class="modal-overlay" style="display:none">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="modal-title">Add Switch</h2>
+        <button class="btn-close" onclick="closeModal('modal-switch')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="switch-form" onsubmit="saveSwitch(event)">
+          <input type="hidden" id="form-id" />
+          <div class="form-group">
+            <label>Name</label>
+            <input type="text" id="form-name" placeholder="e.g. Floor 2 - Room 201" required />
+          </div>
+          <div class="form-group">
+            <label>IP Address</label>
+            <input type="text" id="form-ip" placeholder="10.0.0.1" required
+              pattern="^(\d{1,3}\.){3}\d{1,3}$" />
+          </div>
+          <div class="form-group">
+            <label>Username</label>
+            <input type="text" id="form-username" placeholder="root" required />
+          </div>
+          <div class="form-group">
+            <label>Password</label>
+            <input type="password" id="form-password" placeholder="Password" />
+          </div>
+          <div class="modal-actions">
+            <button type="button" class="btn btn-ghost" onclick="closeModal('modal-switch')">Cancel</button>
+            <button type="submit" class="btn btn-primary">Save</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Network Scan Modal -->
+  <div id="modal-scan" class="modal-overlay" style="display:none">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h2>Scan Network for Axis Switches</h2>
+        <button class="btn-close" onclick="closeModal('modal-scan')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="scan-form">
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label>Subnet / IP Range</label>
+              <input type="text" id="scan-subnet" placeholder="e.g. 10.129.174.0/24 or 10.0.0.1-50" />
+            </div>
+            <div class="form-group">
+              <label>Username</label>
+              <input type="text" id="scan-username" value="root" />
+            </div>
+            <div class="form-group">
+              <label>Password</label>
+              <input type="password" id="scan-password" placeholder="Password" />
+            </div>
+          </div>
+          <div class="modal-actions" style="justify-content:flex-start;margin-bottom:16px">
+            <button class="btn btn-primary" onclick="startScan()">&#128269; Start Scan</button>
+          </div>
+        </div>
+        <div id="scan-progress" style="display:none">
+          <div class="progress-bar"><div class="progress-fill" id="scan-bar"></div></div>
+          <p id="scan-status-text" style="font-size:13px;color:var(--text-muted);margin-top:6px"></p>
+        </div>
+        <div id="scan-results" style="display:none">
+          <div class="scan-results-header">
+            <span id="scan-results-count"></span>
+            <div class="scan-results-actions">
+              <button class="btn btn-ghost btn-sm" onclick="selectAllScanResults(true)">Select All</button>
+              <button class="btn btn-ghost btn-sm" onclick="selectAllScanResults(false)">Deselect All</button>
+            </div>
+          </div>
+          <div id="scan-results-list"></div>
+          <div class="modal-actions" style="margin-top:16px">
+            <button class="btn btn-ghost" onclick="closeModal('modal-scan')">Cancel</button>
+            <button class="btn btn-primary" onclick="addSelectedSwitches()">Add Selected</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bulk Configure Modal -->
+  <div id="modal-bulk-config" class="modal-overlay" style="display:none">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h2>Bulk Configure Switches</h2>
+        <button class="btn-close" onclick="closeModal('modal-bulk-config')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="bulk-layout">
+          <div class="bulk-switches">
+            <div class="bulk-section-title">Target Switches</div>
+            <div id="bulk-switch-list"></div>
+          </div>
+          <div class="bulk-config-form">
+            <div class="bulk-section-title">Configuration to Apply</div>
+
+            <details class="config-section" open>
+              <summary>System Information</summary>
+              <div class="config-section-body">
+                <div class="form-group">
+                  <label>System Name <span class="field-hint">(leave blank to skip)</span></label>
+                  <input type="text" id="bulk-sys-name" placeholder="e.g. Floor 2 Switch" />
+                </div>
+                <div class="form-group">
+                  <label>Location</label>
+                  <input type="text" id="bulk-sys-location" placeholder="e.g. Server Room A" />
+                </div>
+                <div class="form-group">
+                  <label>Contact</label>
+                  <input type="text" id="bulk-sys-contact" placeholder="e.g. it@company.com" />
+                </div>
+              </div>
+            </details>
+
+            <details class="config-section">
+              <summary>PoE Settings</summary>
+              <div class="config-section-body">
+                <p class="hint-text">Apply PoE enable/disable to specific port numbers on all selected switches.</p>
+                <div id="bulk-poe-ports">
+                  <div class="bulk-poe-row">
+                    <label>Port</label>
+                    <input type="number" class="bulk-poe-port" min="1" max="24" placeholder="#" style="width:60px" />
+                    <label>PoE</label>
+                    <select class="bulk-poe-enable">
+                      <option value="true">Enable</option>
+                      <option value="false">Disable</option>
+                    </select>
+                    <label>Priority</label>
+                    <select class="bulk-poe-priority">
+                      <option value="1">Low</option>
+                      <option value="2" selected>High</option>
+                      <option value="3">Critical</option>
+                    </select>
+                  </div>
+                </div>
+                <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="addBulkPoeRow()">+ Add Port</button>
+              </div>
+            </details>
+
+            <details class="config-section">
+              <summary>Port Admin State</summary>
+              <div class="config-section-body">
+                <p class="hint-text">Enable or disable specific port numbers on all selected switches.</p>
+                <div id="bulk-port-rows">
+                  <div class="bulk-port-row">
+                    <label>Port</label>
+                    <input type="number" class="bulk-port-num" min="1" max="24" placeholder="#" style="width:60px" />
+                    <label>Admin</label>
+                    <select class="bulk-port-admin">
+                      <option value="true">Enable</option>
+                      <option value="false">Disable</option>
+                    </select>
+                  </div>
+                </div>
+                <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="addBulkPortRow()">+ Add Port</button>
+              </div>
+            </details>
+          </div>
+        </div>
+        <div id="bulk-progress" style="display:none">
+          <div class="progress-bar"><div class="progress-fill" id="bulk-bar" style="width:0%"></div></div>
+          <p id="bulk-status-text" style="font-size:13px;color:var(--text-muted);margin-top:6px"></p>
+        </div>
+        <div class="modal-actions" style="margin-top:16px">
+          <button class="btn btn-ghost" onclick="closeModal('modal-bulk-config')">Cancel</button>
+          <button class="btn btn-primary" onclick="applyBulkConfig()">Apply to Selected</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast notifications -->
+  <div id="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
