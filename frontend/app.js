@@ -487,18 +487,17 @@ async function loadConfigTab(id) {
 
   let sysConf, poeConf, portConf, ntpConf, portDesc, loopConf, vlanConf, pvlanConf, aggrConf, snmpConf;
   try {
-    [sysConf, poeConf, portConf, ntpConf, portDesc, loopConf, vlanConf, pvlanConf, aggrConf, snmpConf] = await Promise.all([
-      apiFetch(`/switches/${id}/config/system`),
-      apiFetch(`/switches/${id}/config/poe`),
-      apiFetch(`/switches/${id}/ports`),
-      apiFetch(`/switches/${id}/config/ntp`),
-      apiFetch(`/switches/${id}/config/ports_desc`),
-      apiFetch(`/switches/${id}/config/loop`),
-      apiFetch(`/switches/${id}/config/vlan`),
-      apiFetch(`/switches/${id}/config/pvlan`),
-      apiFetch(`/switches/${id}/config/aggregation`),
-      apiFetch(`/switches/${id}/config/snmp`),
-    ]);
+    const all = await apiFetch(`/switches/${id}/config/all`);
+    sysConf   = all.system;
+    poeConf   = all.poe;
+    portConf  = all.ports;
+    ntpConf   = all.ntp;
+    portDesc  = all.ports_desc;
+    loopConf  = all.loop;
+    vlanConf  = all.vlan;
+    pvlanConf = all.pvlan;
+    aggrConf  = all.aggregation;
+    snmpConf  = all.snmp;
   } catch {
     el.innerHTML = `<div class="empty-state"><h3>Could not load configuration</h3></div>`;
     return;

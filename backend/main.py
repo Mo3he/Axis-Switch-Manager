@@ -355,15 +355,65 @@ async def switch_overview(switch_id: str):
 @app.get("/api/switches/{switch_id}/ports")
 async def switch_ports(switch_id: str):
     sw = _find_switch(switch_id)
-    config_raw, traffic_raw, poe_raw = await asyncio.gather(
-        _fetch(sw, "config/ports"),
-        _fetch(sw, "stat/ports"),
-        _fetch(sw, "stat/poe_status"),
-    )
+    # One session for all three fetches
+    async with _switch_session(sw) as client:
+        try:
+            r1 = await client.get("/config/ports")
+            r2 = await client.get("/stat/ports")
+            r3 = await client.get("/stat/poe_status")
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+    config_raw = r1.text if r1.status_code == 200 and not r1.text.startswith("<!DOCTYPE") else ""
+    traffic_raw = r2.text if r2.status_code == 200 and not r2.text.startswith("<!DOCTYPE") else ""
+    poe_raw = r3.text if r3.status_code == 200 and not r3.text.startswith("<!DOCTYPE") else ""
     config = parse_port_config(config_raw)
     traffic = parse_ports(traffic_raw)
     poe = parse_poe_status(poe_raw)
     return merge_port_data(config, traffic, poe)
+
+
+@app.get("/api/switches/{switch_id}/config/all")
+async def get_all_config(switch_id: str):
+    """Fetch all config tab data in a single switch session."""
+    sw = _find_switch(switch_id)
+    paths = [
+        "config/sysinfo",
+        "config/poe_config",
+        "config/ports",
+        "stat/ports",
+        "stat/poe_status",
+        "config/ntp",
+        "config/ports_desc",
+        "config/loop_config",
+        "config/vlan",
+        "config/pvlan",
+        "config/aggregation",
+        "config/snmp",
+    ]
+    async with _switch_session(sw) as client:
+        try:
+            raws = {}
+            for path in paths:
+                resp = await client.get(f"/{path}")
+                raws[path] = resp.text if resp.status_code == 200 and not resp.text.startswith("<!DOCTYPE") else ""
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+    return {
+        "system":      parse_sysinfo(raws["config/sysinfo"]),
+        "poe":         parse_poe_config(raws["config/poe_config"]),
+        "ports":       merge_port_data(
+                           parse_port_config(raws["config/ports"]),
+                           parse_ports(raws["stat/ports"]),
+                           parse_poe_status(raws["stat/poe_status"]),
+                       ),
+        "ntp":         parse_ntp(raws["config/ntp"]),
+        "ports_desc":  parse_ports_desc(raws["config/ports_desc"]),
+        "loop":        parse_loop_config(raws["config/loop_config"]),
+        "vlan":        parse_vlan(raws["config/vlan"]),
+        "pvlan":       parse_pvlan(raws["config/pvlan"]),
+        "aggregation": parse_aggregation(raws["config/aggregation"]),
+        "snmp":        parse_snmp(raws["config/snmp"]),
+    }
 
 
 @app.get("/api/switches/{switch_id}/poe")
@@ -390,9 +440,12 @@ async def dashboard():
     results = []
     for sw in switches:
         try:
-            raw = await _fetch(sw, "stat/sys_overview")
+            async with _switch_session(sw) as client:
+                r1 = await client.get("/stat/sys_overview")
+                r2 = await client.get("/stat/poe_status")
+            raw = r1.text if r1.status_code == 200 and not r1.text.startswith("<!DOCTYPE") else ""
+            poe_raw = r2.text if r2.status_code == 200 and not r2.text.startswith("<!DOCTYPE") else ""
             overview = parse_sys_overview(raw)
-            poe_raw = await _fetch(sw, "stat/poe_status")
             poe = parse_poe_status(poe_raw)
             active_ports = sum(1 for p in poe if "ON" in p.get("status", ""))
             total_poe_w = sum(p["current_power"] for p in poe)
