@@ -9,6 +9,7 @@ import json
 import random
 import re
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -70,11 +71,8 @@ class SwitchUpdate(BaseModel):
 # Switch session helper
 # ---------------------------------------------------------------------------
 
-_http_clients: dict[str, httpx.AsyncClient] = {}
-
-
-def _make_cookies(switch: dict) -> dict:
-    """Return the cookies needed to authenticate with a switch."""
+def _make_cookies() -> dict:
+    """Return fresh random session cookies for a switch login."""
     return {
         "cid": str(random.randint(100_000_000, 999_999_999)),
         "seid": str(random.randint(100_000_000, 999_999_999)),
@@ -82,20 +80,50 @@ def _make_cookies(switch: dict) -> dict:
     }
 
 
-async def _get_client(switch: dict) -> httpx.AsyncClient:
-    """Return a cached, authenticated AsyncClient for a switch."""
-    sw_id = switch["id"]
-    client = _http_clients.get(sw_id)
-    if client is None or client.is_closed:
-        client = httpx.AsyncClient(
-            base_url=f"http://{switch['ip']}",
-            timeout=10.0,
-            follow_redirects=True,
-        )
-        _http_clients[sw_id] = client
+@asynccontextmanager
+async def _switch_session(switch: dict):
+    """
+    Async context manager: opens a fresh connection, logs in, yields the
+    authenticated client, then always closes it on exit.
+    Switches support very few concurrent sessions - we never hold them open.
+    """
+    client = httpx.AsyncClient(
+        base_url=f"http://{switch['ip']}",
+        timeout=10.0,
+        follow_redirects=True,
+    )
+    try:
+        cookies = _make_cookies()
+        try:
+            resp = await client.post(
+                "/config/login",
+                data={"username": switch["username"], "password": switch["password"]},
+                cookies=cookies,
+            )
+            if resp.status_code not in (200, 302):
+                raise HTTPException(status_code=502, detail=f"Login failed for {switch['ip']}")
+            client.cookies.update(cookies)
+        except httpx.ConnectError:
+            raise HTTPException(status_code=503, detail=f"Cannot connect to {switch['ip']}")
+        yield client
+    finally:
+        await client.aclose()
 
-    # Attempt login; the switch validates credentials per request using cookies
-    cookies = _make_cookies(switch)
+
+# Keep _get_client and _fetch as thin wrappers so existing POST endpoints
+# work with minimal change - they now get a fresh client every call.
+
+async def _get_client(switch: dict) -> httpx.AsyncClient:
+    """
+    Returns a fresh authenticated client. Caller MUST call aclose() when done.
+    Prefer using _switch_session() context manager instead.
+    """
+    client = httpx.AsyncClient(
+        base_url=f"http://{switch['ip']}",
+        timeout=10.0,
+        follow_redirects=True,
+    )
+    cookies = _make_cookies()
     try:
         resp = await client.post(
             "/config/login",
@@ -103,24 +131,25 @@ async def _get_client(switch: dict) -> httpx.AsyncClient:
             cookies=cookies,
         )
         if resp.status_code not in (200, 302):
+            await client.aclose()
             raise HTTPException(status_code=502, detail=f"Login failed for {switch['ip']}")
-        # Carry forward auth cookies
         client.cookies.update(cookies)
     except httpx.ConnectError:
+        await client.aclose()
         raise HTTPException(status_code=503, detail=f"Cannot connect to {switch['ip']}")
     return client
 
 
 async def _fetch(switch: dict, path: str) -> str:
-    """Fetch a stat/config path from a switch and return raw text."""
-    client = await _get_client(switch)
-    try:
-        resp = await client.get(f"/{path}")
-        if resp.status_code != 200 or resp.text.startswith("<!DOCTYPE"):
-            return ""
-        return resp.text
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    """Fetch a stat/config path from a switch, always closing the connection."""
+    async with _switch_session(switch) as client:
+        try:
+            resp = await client.get(f"/{path}")
+            if resp.status_code != 200 or resp.text.startswith("<!DOCTYPE"):
+                return ""
+            return resp.text
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -400,31 +429,23 @@ class PortControlPayload(BaseModel):
 async def port_control(switch_id: str, payload: PortControlPayload):
     """Enable or disable a port (admin state)."""
     sw = _find_switch(switch_id)
-    client = await _get_client(sw)
-    # The switch config/ports endpoint accepts POST with port configuration data
-    # We read current config first, then patch the target port
     config_raw = await _fetch(sw, "config/ports")
     ports = parse_port_config(config_raw)
 
-    # Build the POST body - the switch expects each port's full row
     rows = []
     for p in ports:
-        admin = "1" if (p["port"] == payload.port and not payload.admin_enabled is True
-                        or p["port"] != payload.port and p["admin_enabled"]) else "0"
         if p["port"] == payload.port:
             admin = "1" if payload.admin_enabled else "0"
         else:
             admin = "1" if p["admin_enabled"] else "0"
         rows.append(f"{p['port']}/{admin}")
 
-    try:
-        resp = await client.post(
-            "/config/ports",
-            data={"port_data": "|".join(rows)},
-        )
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            await client.post("/config/ports", data={"port_data": "|".join(rows)})
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -465,19 +486,19 @@ async def set_system_config(switch_id: str, payload: SystemConfigPayload):
     name = payload.sys_name if payload.sys_name is not None else current.get("sys_name", "")
     contact = payload.sys_contact if payload.sys_contact is not None else current.get("sys_contact", "")
     location = payload.sys_location if payload.sys_location is not None else current.get("sys_location", "")
-    client = await _get_client(sw)
-    try:
-        resp = await client.post(
-            "/config/sysinfo",
-            data={
-                "sys_contact": contact,
-                "sys_name": name,
-                "sys_location": location,
-            },
-        )
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            await client.post(
+                "/config/sysinfo",
+                data={
+                    "sys_contact": contact,
+                    "sys_name": name,
+                    "sys_location": location,
+                },
+            )
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -554,15 +575,15 @@ async def set_poe_config(switch_id: str, payload: PoeConfigPayload):
     # Rebuild full payload preserving other sections
     parts[2] = ",".join(new_port_entries)
     new_raw = "|".join(parts)
-    client = await _get_client(sw)
-    try:
-        resp = await client.post(
-            "/config/poe_config",
-            data={"PoeData": new_raw},
-        )
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            resp = await client.post(
+                "/config/poe_config",
+                data={"PoeData": new_raw},
+            )
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -587,12 +608,12 @@ async def set_ports_config(switch_id: str, payload: PortsConfigPayload):
         if "admin_enabled" in pp:
             fields[2] = "1" if pp["admin_enabled"] else "0"
         rows.append("/".join(fields))
-    client = await _get_client(sw)
-    try:
-        await client.post("/config/ports", data={"portData": "|".join(rows)})
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            await client.post("/config/ports", data={"portData": "|".join(rows)})
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -778,20 +799,20 @@ class NtpConfigPayload(BaseModel):
 @app.post("/api/switches/{switch_id}/config/ntp")
 async def set_ntp_config(switch_id: str, payload: NtpConfigPayload):
     sw = _find_switch(switch_id)
-    client = await _get_client(sw)
-    try:
-        await client.post("/config/ntp", data={
-            "ntp_mode": str(payload.mode),
-            "ntp_polling_interval": str(payload.interval),
-            "ntp_server1": payload.server1,
-            "ntp_server2": payload.server2,
-            "ntp_server3": payload.server3,
-            "ntp_server4": payload.server4,
-            "ntp_server5": payload.server5,
-        })
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            await client.post("/config/ntp", data={
+                "ntp_mode": str(payload.mode),
+                "ntp_polling_interval": str(payload.interval),
+                "ntp_server1": payload.server1,
+                "ntp_server2": payload.server2,
+                "ntp_server3": payload.server3,
+                "ntp_server4": payload.server4,
+                "ntp_server5": payload.server5,
+            })
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -843,14 +864,13 @@ async def set_ports_desc(switch_id: str, payload: PortsDescPayload):
     current = {p["port"]: p["description"] for p in parse_ports_desc(raw)}
     patch = {p.port: p.description for p in payload.ports}
     current.update(patch)
-    client = await _get_client(sw)
-    # Build form data: desc_1, desc_2, ...
     form_data = {f"desc_{port}": desc for port, desc in sorted(current.items())}
-    try:
-        await client.post("/config/ports_desc", data=form_data)
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            await client.post("/config/ports_desc", data=form_data)
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -920,7 +940,6 @@ async def set_loop_config(switch_id: str, payload: LoopConfigPayload):
     raw = await _fetch(sw, "config/loop_config")
     current = parse_loop_config(raw)
     patch = {p.port: p for p in payload.ports}
-    client = await _get_client(sw)
     form_data: dict = {
         "gbl_enable": "1" if payload.global_enable else "0",
         "tx_time": str(payload.tx_interval),
@@ -934,11 +953,12 @@ async def set_loop_config(switch_id: str, payload: LoopConfigPayload):
         form_data[f"enable_{p['port']}"] = "on" if enable else ""
         form_data[f"action_{p['port']}"] = str(action)
         form_data[f"txmode_{p['port']}"] = str(int(tx_mode))
-    try:
-        await client.post("/config/loop_config", data=form_data)
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            await client.post("/config/loop_config", data=form_data)
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -1006,10 +1026,7 @@ async def set_vlan_config(switch_id: str, payload: VlanConfigPayload):
     raw = await _fetch(sw, "config/vlan")
     current = parse_vlan(raw)
     patch = {p.port: p for p in payload.ports}
-    client = await _get_client(sw)
     form_data: dict = {"tpid": payload.tpid}
-    # Build port config entries
-    port_entries = []
     for p in current["ports"]:
         pp = patch.get(p["port"])
         mode = pp.mode if pp else p["mode"]
@@ -1024,11 +1041,12 @@ async def set_vlan_config(switch_id: str, payload: VlanConfigPayload):
         form_data[f"ingressflt_{p['port']}"] = "on" if ingress_filter else ""
         form_data[f"tx_tag_{p['port']}"] = str(tx_tag)
         form_data[f"allowed_{p['port']}"] = allowed
-    try:
-        await client.post("/config/vlan", data=form_data)
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            await client.post("/config/vlan", data=form_data)
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -1082,17 +1100,17 @@ async def set_pvlan_config(switch_id: str, payload: PvlanConfigPayload):
     raw = await _fetch(sw, "config/pvlan")
     current = parse_pvlan(raw)
     patch = {p.port: p for p in payload.ports}
-    client = await _get_client(sw)
     form_data: dict = {"pvlan_id": str(payload.pvlan_id)}
     for p in current["ports"]:
         pp = patch.get(p["port"])
         mode = pp.mode if pp else p["mode"]
         form_data[f"pvlanport_{p['port']}"] = str(mode)
-    try:
-        await client.post("/config/pvlan", data=form_data)
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            await client.post("/config/pvlan", data=form_data)
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -1172,12 +1190,12 @@ async def set_ports_speed(switch_id: str, payload: PortsSpeedPayload):
             new_rows.append("/".join(raw_fields))
         elif raw_fields:
             new_rows.append("/".join(raw_fields))
-    client = await _get_client(sw)
-    try:
-        await client.post("/config/ports", data={"portData": "|".join(new_rows)})
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            await client.post("/config/ports", data={"portData": "|".join(new_rows)})
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -1261,12 +1279,12 @@ async def set_snmp_config(switch_id: str, payload: SnmpConfigPayload):
         new_parts.append(prefix + "/".join(fields))
 
     new_raw = "|".join(new_parts)
-    client = await _get_client(sw)
-    try:
-        await client.post("/config/snmp", data={"snmpData": new_raw})
-        return {"ok": True}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    async with _switch_session(sw) as client:
+        try:
+            await client.post("/config/snmp", data={"snmpData": new_raw})
+            return {"ok": True}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------

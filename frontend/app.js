@@ -13,8 +13,8 @@ let allSwitches = [];
 // Auto-refresh timers
 let _dashTimer = null;
 let _detailTimer = null;
-const DEFAULT_DASH_INTERVAL = 5000;
-const DEFAULT_DETAIL_INTERVAL = 5000;
+const DEFAULT_DASH_INTERVAL = 30000;
+const DEFAULT_DETAIL_INTERVAL = 15000;
 
 function _getSettings() {
   return {
