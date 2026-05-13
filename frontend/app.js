@@ -1380,420 +1380,113 @@ async function applyBulkConfig() {
 // Network Topology
 // ---------------------------------------------------------------------------
 
-let _topoGraph = null;
-
 async function loadTopologyView() {
   const statusEl = document.getElementById("topology-status");
-  const canvas   = document.getElementById("topology-canvas");
-  const linksEl  = document.getElementById("topology-links");
+  const treeEl   = document.getElementById("topology-tree");
 
-  if (_topoGraph) { _topoGraph.destroy(); _topoGraph = null; }
-  if (linksEl) linksEl.innerHTML = "";
-
-  statusEl.textContent = "Loading topology data via SNMP / LLDP…";
-  canvas.style.opacity = "0.3";
+  treeEl.innerHTML = '<div class="topo-loading">Loading topology via SNMP / LLDP\u2026</div>';
 
   let data;
   try {
     data = await apiFetch("/topology");
   } catch {
     statusEl.textContent = "Failed to load topology data.";
-    canvas.style.opacity = "1";
+    treeEl.innerHTML = '';
     return;
   }
 
-  canvas.style.opacity = "1";
   const { nodes, edges, snmp_status } = data;
-
-  // Status bar
   const noLldp  = Object.values(snmp_status).filter(s => s === "no_lldp").length;
   const errored = Object.values(snmp_status).filter(s => s.startsWith("error")).length;
   const msgs = [];
   if (noLldp)  msgs.push(`${noLldp} switch${noLldp > 1 ? "es" : ""} returned no LLDP data`);
   if (errored) msgs.push(`${errored} switch${errored > 1 ? "es" : ""} unreachable via SNMP`);
-  if (!edges.length && !msgs.length) msgs.push("No links found — ensure SNMP is enabled and LLDP neighbors have formed");
+  if (!edges.length && !msgs.length) msgs.push("No links found: ensure SNMP is enabled and LLDP neighbors have formed");
   statusEl.textContent = msgs.length
-    ? msgs.join("  ·  ")
+    ? msgs.join("  \u00b7  ")
     : `${nodes.length} device${nodes.length !== 1 ? "s" : ""}, ${edges.length} link${edges.length !== 1 ? "s" : ""}`;
 
-  if (!nodes.length) { statusEl.textContent = "No switches configured."; return; }
+  if (!nodes.length) { treeEl.innerHTML = '<div class="topo-loading">No switches configured.</div>'; return; }
 
-  _topoGraph = new TopologyGraph(canvas, nodes, edges);
-
-  // Build connection table
-  if (linksEl && edges.length) {
-    const nodeById = Object.fromEntries(nodes.map(n => [n.id, n]));
-    const rows = edges.map(e => {
-      const src = nodeById[e.source] || { name: e.source, ip: "" };
-      const tgt = nodeById[e.target] || { name: e.target, ip: "" };
-      const sp = e.source_port != null ? `Port ${e.source_port}` : "—";
-      const tp = _parsePortLabel(e.target_port);
-      return `<tr>
-        <td><strong>${src.name}</strong><br><span class="topo-ip">${src.ip}</span></td>
-        <td class="topo-port">${sp}</td>
-        <td class="topo-arrow">↔</td>
-        <td class="topo-port">${tp}</td>
-        <td><strong>${tgt.name}</strong><br><span class="topo-ip">${tgt.ip}</span></td>
-      </tr>`;
-    }).join("");
-    linksEl.innerHTML = `
-      <div class="topo-links-title">Connections (${edges.length})</div>
-      <table class="topo-links-table">
-        <thead><tr><th>Switch A</th><th>Port A</th><th></th><th>Port B</th><th>Switch B</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>`;
-  }
+  _renderTopologyTree(treeEl, nodes, edges);
 }
 
-function _parsePortLabel(portStr) {
-  if (portStr == null || portStr === "") return "—";
-  const s = String(portStr).trim();
-  if (/^\d+$/.test(s)) return `Port ${s}`;
-  const m = s.match(/(\d+)$/);
-  return m ? `Port ${m[1]}` : s;
+function _renderTopologyTree(container, nodes, edges) {
+  const nodeById = Object.fromEntries(nodes.map(n => [n.id, n]));
+
+  if (!edges.length) {
+    container.innerHTML =
+      '<div class="topo-no-links">No LLDP connections found yet. Try refreshing in a minute after LLDP neighbors form.</div>' +
+      '<div class="topo-isolated-grid">' + nodes.map(n => _topoNodeHtml(n, true)).join('') + '</div>';
+    return;
+  }
+
+  // Build adjacency list with port numbers on both sides
+  const adj = {};
+  nodes.forEach(n => { adj[n.id] = []; });
+  edges.forEach(e => {
+    const sp = _topoPortNum(e.source_port);
+    const tp = _topoPortNum(e.target_port);
+    adj[e.source].push({ id: e.target, localPort: sp, remotePort: tp });
+    adj[e.target].push({ id: e.source, localPort: tp, remotePort: sp });
+  });
+
+  // Build spanning forest starting from most-connected switch
+  const visited = new Set();
+  const components = [];
+  [...nodes]
+    .sort((a, b) => (adj[b.id]?.length || 0) - (adj[a.id]?.length || 0))
+    .forEach(n => {
+      if (!visited.has(n.id)) components.push(_topoSubtree(n.id, visited, adj, nodeById));
+    });
+
+  container.innerHTML = components.map(comp =>
+    '<div class="topo-component">' +
+    '<div class="topo-row">' + _topoNodeHtml(comp.node, true) + '</div>' +
+    _topoChildrenHtml(comp.children) +
+    '</div>'
+  ).join('');
 }
 
-class TopologyGraph {
-  static NODE_W = 192;
-  static NODE_H = 74;
-  static PORTS  = 24;
+function _topoPortNum(p) {
+  if (p == null || p === '') return null;
+  const m = String(p).trim().match(/(\d+)$/);
+  const n = m ? parseInt(m[1], 10) : NaN;
+  return isNaN(n) ? String(p) : n;
+}
 
-  constructor(canvas, nodes, edges) {
-    this.canvas = canvas;
-    this.ctx    = canvas.getContext("2d");
-    const rect  = canvas.getBoundingClientRect();
-    canvas.width  = rect.width  || 960;
-    canvas.height = rect.height || 540;
-    this.W = canvas.width;
-    this.H = canvas.height;
+function _topoSubtree(id, visited, adj, nodeById) {
+  visited.add(id);
+  const children = (adj[id] || [])
+    .filter(e => !visited.has(e.id))
+    .map(e => ({ localPort: e.localPort, remotePort: e.remotePort, subtree: _topoSubtree(e.id, visited, adj, nodeById) }));
+  return { node: nodeById[id], children };
+}
 
-    // Grid initial layout
-    const cols  = Math.max(3, Math.ceil(Math.sqrt(nodes.length * 1.6)));
-    const gapX  = this.W / (cols + 0.8);
-    const rows  = Math.ceil(nodes.length / cols);
-    const gapY  = (this.H - 60) / (rows + 0.5);
+function _topoChildrenHtml(children) {
+  if (!children.length) return '';
+  return '<div class="topo-children">' +
+    children.map(c => {
+      const sp = c.localPort  != null ? `P${c.localPort}`  : '?';
+      const tp = c.remotePort != null ? `P${c.remotePort}` : '?';
+      return '<div class="topo-child">' +
+        '<div class="topo-row">' +
+          `<span class="topo-port-link">${sp} \u2194 ${tp}</span>` +
+          _topoNodeHtml(c.subtree.node, false) +
+        '</div>' +
+        _topoChildrenHtml(c.subtree.children) +
+        '</div>';
+    }).join('') +
+  '</div>';
+}
 
-    this.nodes = nodes.map((n, i) => ({
-      ...n,
-      w: TopologyGraph.NODE_W,
-      h: TopologyGraph.NODE_H,
-      x: gapX * ((i % cols) + 1) + (Math.random() - 0.5) * 10,
-      y: 60 + gapY * (Math.floor(i / cols) + 0.8),
-      vx: 0, vy: 0, fixed: false,
-    }));
-    this.nodeById = Object.fromEntries(this.nodes.map(n => [n.id, n]));
-
-    // Pre-parse port numbers on edges
-    this.edges = edges.map(e => ({
-      ...e,
-      srcPortNum: Number.isInteger(e.source_port) ? e.source_port : parseInt(e.source_port, 10) || null,
-      tgtPortNum: this._parsePortNum(e.target_port),
-    }));
-
-    this.dragging    = null;
-    this.hovering    = null;
-    this.hoveredEdge = null;
-    this._animId     = null;
-    this._alpha      = 1.0;
-
-    for (let i = 0; i < 180; i++) this._tick(0.85);
-    this._setupEvents();
-    this._animate();
-
-    this._onResize = () => {
-      const r = canvas.getBoundingClientRect();
-      canvas.width  = r.width;
-      canvas.height = r.height;
-      this.W = canvas.width;
-      this.H = canvas.height;
-    };
-    window.addEventListener("resize", this._onResize);
-  }
-
-  _parsePortNum(portStr) {
-    if (portStr == null || portStr === "") return null;
-    const s = String(portStr).trim();
-    if (/^\d+$/.test(s)) return parseInt(s, 10);
-    const m = s.match(/(\d+)$/);
-    return m ? parseInt(m[1], 10) : null;
-  }
-
-  _portPos(node, portNum) {
-    const t  = ((portNum || 1) - 1) / (TopologyGraph.PORTS - 1);
-    const px = (node.x - node.w / 2 + 5) + t * (node.w - 10);
-    return { x: px, y: node.y + node.h / 2 };
-  }
-
-  _tick(alpha) {
-    const { nodes } = this;
-    const W = this.W, H = this.H;
-    const cx = W / 2, cy = H / 2;
-    const REPULSION  = 14000;
-    const SPRING_LEN = Math.min(W, H) * 0.32;
-    const SPRING_K   = 0.022;
-    const GRAVITY    = 0.007;
-    const DAMPING    = 0.74;
-
-    for (const n of nodes) { n.fx = 0; n.fy = 0; }
-    for (const n of nodes) { n.fx += (cx - n.x) * GRAVITY; n.fy += (cy - n.y) * GRAVITY; }
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const dx = nodes[j].x - nodes[i].x, dy = nodes[j].y - nodes[i].y;
-        const d2 = Math.max(dx * dx + dy * dy, 1);
-        const d  = Math.sqrt(d2);
-        const f  = REPULSION / d2;
-        const fx = dx / d * f, fy = dy / d * f;
-        nodes[i].fx -= fx; nodes[i].fy -= fy;
-        nodes[j].fx += fx; nodes[j].fy += fy;
-      }
-    }
-    for (const e of this.edges) {
-      const s = this.nodeById[e.source], t = this.nodeById[e.target];
-      if (!s || !t) continue;
-      const dx = t.x - s.x, dy = t.y - s.y;
-      const d  = Math.sqrt(dx * dx + dy * dy) || 1;
-      const f  = (d - SPRING_LEN) * SPRING_K;
-      const fx = dx / d * f, fy = dy / d * f;
-      s.fx += fx; s.fy += fy;
-      t.fx -= fx; t.fy -= fy;
-    }
-    const PAD = 110;
-    for (const n of nodes) {
-      if (n.x < PAD)      n.fx += (PAD - n.x) * 0.5;
-      if (n.x > W - PAD)  n.fx += (W - PAD - n.x) * 0.5;
-      if (n.y < PAD)      n.fy += (PAD - n.y) * 0.5;
-      if (n.y > H - PAD)  n.fy += (H - PAD - n.y) * 0.5;
-    }
-    for (const n of nodes) {
-      if (n.fixed) continue;
-      n.vx = (n.vx + n.fx * alpha) * DAMPING;
-      n.vy = (n.vy + n.fy * alpha) * DAMPING;
-      n.x += n.vx; n.y += n.vy;
-    }
-  }
-
-  _draw() {
-    const { ctx } = this;
-    const W = this.W, H = this.H;
-    ctx.clearRect(0, 0, W, H);
-
-    // Subtle grid
-    ctx.strokeStyle = "#f1f5f9";
-    ctx.lineWidth = 1;
-    for (let x = 0; x < W; x += 44) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
-    for (let y = 0; y < H; y += 44) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
-
-    // Pre-compute connected ports per node
-    const connPorts = {};
-    for (const e of this.edges) {
-      if (!connPorts[e.source]) connPorts[e.source] = new Set();
-      if (!connPorts[e.target]) connPorts[e.target] = new Set();
-      if (e.srcPortNum) connPorts[e.source].add(e.srcPortNum);
-      if (e.tgtPortNum) connPorts[e.target].add(e.tgtPortNum);
-    }
-
-    // Draw edges first (behind nodes)
-    for (const e of this.edges) this._drawEdge(e);
-
-    // Draw nodes on top
-    for (const n of this.nodes) this._drawNode(n, connPorts[n.id] || new Set());
-
-    ctx.textBaseline = "alphabetic";
-  }
-
-  _drawEdge(e) {
-    const { ctx } = this;
-    const s = this.nodeById[e.source], t = this.nodeById[e.target];
-    if (!s || !t) return;
-
-    const isHov = this.hoveredEdge === e ||
-                  (this.hovering && (this.hovering.id === e.source || this.hovering.id === e.target));
-
-    const sp = e.srcPortNum ? this._portPos(s, e.srcPortNum) : { x: s.x, y: s.y + s.h / 2 };
-    const tp = e.tgtPortNum ? this._portPos(t, e.tgtPortNum) : { x: t.x, y: t.y + t.h / 2 };
-    const sag = Math.min(130, 45 + Math.abs(sp.x - tp.x) * 0.2 + Math.abs(sp.y - tp.y) * 0.1);
-
-    const lineColor = isHov ? "#0063a3" : "#94a3b8";
-
-    // Port connector dots
-    ctx.fillStyle = lineColor;
-    ctx.beginPath(); ctx.arc(sp.x, sp.y, 3.5, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc(tp.x, tp.y, 3.5, 0, Math.PI * 2); ctx.fill();
-
-    // Bezier cable (U-shape downward)
-    ctx.beginPath();
-    ctx.moveTo(sp.x, sp.y);
-    ctx.bezierCurveTo(sp.x, sp.y + sag, tp.x, tp.y + sag, tp.x, tp.y);
-    ctx.strokeStyle = lineColor;
-    ctx.lineWidth   = isHov ? 2.5 : 1.5;
-    ctx.stroke();
-
-    // Midpoint label "P5 ↔ P3"
-    // Bezier midpoint at t=0.5: x=(sp.x+tp.x)/2, y=(sp.y+tp.y)/2 + 0.75*sag
-    const midX  = (sp.x + tp.x) / 2;
-    const midY  = (sp.y + tp.y) / 2 + sag * 0.75;
-    const label = `P${e.srcPortNum ?? "?"} ↔ P${e.tgtPortNum ?? "?"}`;
-
-    ctx.font = "bold 10px system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    const tw = ctx.measureText(label).width + 12;
-    ctx.fillStyle   = isHov ? "#0063a3" : "#f1f5f9";
-    ctx.strokeStyle = isHov ? "#0063a3" : "#cbd5e1";
-    ctx.lineWidth   = 1;
-    ctx.beginPath();
-    if (ctx.roundRect) ctx.roundRect(midX - tw / 2, midY - 9, tw, 18, 4);
-    else               ctx.rect(midX - tw / 2, midY - 9, tw, 18);
-    ctx.fill();
-    ctx.stroke();
-    ctx.fillStyle = isHov ? "#ffffff" : "#475569";
-    ctx.fillText(label, midX, midY);
-  }
-
-  _drawNode(n, connPorts) {
-    const { ctx } = this;
-    const hov = this.hovering === n ||
-                (this.hoveredEdge && (this.hoveredEdge.source === n.id || this.hoveredEdge.target === n.id));
-    const x = n.x - n.w / 2, y = n.y - n.h / 2;
-    const PORT_ROW_H = 20;
-    const headerH    = n.h - PORT_ROW_H;
-
-    ctx.shadowColor   = "rgba(0,0,0,0.20)";
-    ctx.shadowBlur    = hov ? 22 : 8;
-    ctx.shadowOffsetY = 2;
-
-    // Header
-    ctx.fillStyle = n.managed ? (hov ? "#1d4ed8" : "#1e3a5f") : (hov ? "#64748b" : "#334155");
-    ctx.beginPath();
-    if (ctx.roundRect) ctx.roundRect(x, y, n.w, headerH, [10, 10, 0, 0]);
-    else               ctx.rect(x, y, n.w, headerH);
-    ctx.fill();
-
-    ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
-
-    // Port row
-    ctx.fillStyle = n.managed ? "#0f2340" : "#1e293b";
-    ctx.beginPath();
-    if (ctx.roundRect) ctx.roundRect(x, y + headerH, n.w, PORT_ROW_H, [0, 0, 10, 10]);
-    else               ctx.rect(x, y + headerH, n.w, PORT_ROW_H);
-    ctx.fill();
-
-    // Border
-    ctx.strokeStyle = hov ? "#60a5fa" : "rgba(255,255,255,0.12)";
-    ctx.lineWidth   = hov ? 2 : 1;
-    ctx.beginPath();
-    if (ctx.roundRect) ctx.roundRect(x, y, n.w, n.h, 10);
-    else               ctx.rect(x, y, n.w, n.h);
-    ctx.stroke();
-
-    // Switch icon
-    const ix = x + 10, iy = y + 9;
-    ctx.fillStyle = "rgba(255,255,255,0.9)";
-    for (let r = 0; r < 3; r++) ctx.fillRect(ix, iy + r * 5, 14, 2);
-    ctx.fillStyle = "#7dd3fc";
-    ctx.beginPath(); ctx.arc(ix + 2, iy + 1, 2, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc(ix + 2, iy + 6, 2, 0, Math.PI * 2); ctx.fill();
-
-    // Name
-    ctx.fillStyle    = "#ffffff";
-    ctx.font         = `${hov ? "bold " : ""}11px system-ui, sans-serif`;
-    ctx.textAlign    = "left";
-    ctx.textBaseline = "middle";
-    let label = n.name.length > 20 ? n.name.slice(0, 18) + "…" : n.name;
-    ctx.fillText(label, ix + 20, y + 14);
-
-    // IP
-    ctx.fillStyle = "rgba(255,255,255,0.55)";
-    ctx.font = "9px system-ui, sans-serif";
-    ctx.fillText(n.ip || "", ix + 20, y + 27);
-
-    // Port indicators
-    const PC     = TopologyGraph.PORTS;
-    const portY  = y + headerH + 3;
-    const portW  = (n.w - 8) / PC;
-    const portH  = PORT_ROW_H - 6;
-
-    for (let p = 1; p <= PC; p++) {
-      const px        = x + 4 + (p - 1) * portW;
-      const connected = connPorts.has(p);
-      ctx.fillStyle   = connected ? "#22c55e" : "rgba(255,255,255,0.10)";
-      ctx.fillRect(px + 0.5, portY, portW - 1.5, portH);
-
-      // Port number label inside the slot when hovered
-      if (connected && hov) {
-        ctx.fillStyle    = "#ffffff";
-        ctx.font         = "7px system-ui, sans-serif";
-        ctx.textAlign    = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(p, px + portW / 2, portY + portH / 2);
-      }
-    }
-    ctx.textBaseline = "alphabetic";
-  }
-
-  _animate() {
-    this._animId = requestAnimationFrame(() => {
-      if (this._alpha > 0.005 || this.dragging) {
-        this._tick(Math.max(this._alpha, this.dragging ? 0.15 : 0));
-        this._alpha *= 0.97;
-      }
-      this._draw();
-      this._animate();
-    });
-  }
-
-  _nodeAt(x, y) {
-    for (const n of this.nodes) {
-      if (x >= n.x - n.w / 2 && x <= n.x + n.w / 2 &&
-          y >= n.y - n.h / 2 && y <= n.y + n.h / 2) return n;
-    }
-    return null;
-  }
-
-  _edgeLabelAt(x, y) {
-    for (const e of this.edges) {
-      const s = this.nodeById[e.source], t = this.nodeById[e.target];
-      if (!s || !t) continue;
-      const sp  = e.srcPortNum ? this._portPos(s, e.srcPortNum) : { x: s.x, y: s.y + s.h / 2 };
-      const tp  = e.tgtPortNum ? this._portPos(t, e.tgtPortNum) : { x: t.x, y: t.y + t.h / 2 };
-      const sag = Math.min(130, 45 + Math.abs(sp.x - tp.x) * 0.2 + Math.abs(sp.y - tp.y) * 0.1);
-      const midX = (sp.x + tp.x) / 2, midY = (sp.y + tp.y) / 2 + sag * 0.75;
-      const dx = x - midX, dy = y - midY;
-      if (dx * dx + dy * dy < 625) return e;
-    }
-    return null;
-  }
-
-  _setupEvents() {
-    const c = this.canvas;
-    c.addEventListener("mousedown", e => {
-      const r = c.getBoundingClientRect();
-      const n = this._nodeAt(e.clientX - r.left, e.clientY - r.top);
-      if (n) { this.dragging = n; n.fixed = true; this._alpha = 0.4; c.style.cursor = "grabbing"; }
-    });
-    c.addEventListener("mousemove", e => {
-      const r = c.getBoundingClientRect();
-      const x = e.clientX - r.left, y = e.clientY - r.top;
-      if (this.dragging) { this.dragging.x = x; this.dragging.y = y; }
-      else {
-        this.hovering    = this._nodeAt(x, y);
-        this.hoveredEdge = this.hovering ? null : this._edgeLabelAt(x, y);
-        c.style.cursor   = (this.hovering || this.hoveredEdge) ? "pointer" : "grab";
-      }
-    });
-    c.addEventListener("mouseup", () => {
-      if (this.dragging) { this.dragging.fixed = false; this.dragging = null; c.style.cursor = "grab"; }
-    });
-    c.addEventListener("mouseleave", () => {
-      if (this.dragging) { this.dragging.fixed = false; this.dragging = null; }
-      this.hovering = null; this.hoveredEdge = null;
-    });
-  }
-
-  destroy() {
-    cancelAnimationFrame(this._animId);
-    window.removeEventListener("resize", this._onResize);
-  }
+function _topoNodeHtml(node, isRoot) {
+  const cls = 'topo-node-box' + (isRoot ? ' root' : '') + (!node.managed ? ' unmanaged' : '');
+  return `<div class="${cls}">` +
+    `<span class="topo-sw-icon"></span>` +
+    `<span class="topo-sw-name">${node.name}</span>` +
+    (node.ip ? `<span class="topo-sw-ip">${node.ip}</span>` : '') +
+    '</div>';
 }
 
 

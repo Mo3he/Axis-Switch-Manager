@@ -773,22 +773,134 @@ select.priority-sel {
 /* ---- Network Topology ---- */
 #topology-container {
   width: 100%;
-  height: calc(100vh - 230px);
+  max-height: calc(100vh - 200px);
   min-height: 420px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 12px;
-  overflow: hidden;
+  overflow-y: auto;
   position: relative;
 }
 
-#topology-canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
-  cursor: grab;
+#topology-tree {
+  padding: 20px 24px;
+  min-height: 100%;
+  box-sizing: border-box;
+  font-size: 13px;
+  font-family: system-ui, sans-serif;
 }
-#topology-canvas:active { cursor: grabbing; }
+
+.topo-loading {
+  padding: 20px;
+  color: var(--text-muted);
+}
+
+.topo-no-links {
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  background: #fef9c3;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  color: #713f12;
+}
+
+.topo-component {
+  margin-bottom: 20px;
+}
+.topo-component + .topo-component {
+  border-top: 1px solid var(--border);
+  padding-top: 20px;
+}
+
+.topo-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.topo-node-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #1e3a5f;
+  color: #fff;
+  border-radius: 6px;
+  padding: 5px 12px 5px 10px;
+  font-size: 13px;
+  white-space: nowrap;
+  user-select: none;
+}
+.topo-node-box:hover { filter: brightness(1.18); }
+.topo-node-box.root {
+  background: #0063a3;
+  font-weight: 600;
+  font-size: 14px;
+  padding: 7px 14px 7px 11px;
+}
+.topo-node-box.unmanaged { background: #334155; }
+
+.topo-sw-icon {
+  display: inline-block;
+  width: 16px;
+  height: 12px;
+  background:
+    linear-gradient(#fff 0 0) 0 1px/16px 2.5px,
+    linear-gradient(#fff 0 0) 0 5.5px/16px 2.5px,
+    linear-gradient(#fff 0 0) 0 10px/16px 2.5px;
+  background-repeat: no-repeat;
+  opacity: 0.85;
+  flex-shrink: 0;
+}
+
+.topo-sw-name { font-weight: 600; }
+.topo-sw-ip {
+  font-size: 11px;
+  font-family: monospace;
+  opacity: 0.6;
+}
+
+/* Tree lines */
+.topo-children {
+  margin-left: 22px;
+  padding-left: 0;
+  border-left: 2px solid var(--border);
+}
+
+.topo-child {
+  position: relative;
+  padding-left: 22px;
+}
+.topo-child::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 16px;
+  width: 20px;
+  height: 2px;
+  background: var(--border);
+}
+
+.topo-port-link {
+  font-family: monospace;
+  font-size: 11px;
+  font-weight: 700;
+  color: #0063a3;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 4px;
+  padding: 2px 7px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Isolated node grid (no edges) */
+.topo-isolated-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 
 .topology-legend {
   display: flex;
@@ -799,67 +911,6 @@ select.priority-sel {
   color: var(--text);
   flex-wrap: wrap;
 }
-
-/* ---- Topology connection table ---- */
-#topology-links {
-  margin-top: 16px;
-}
-
-.topo-links-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-muted);
-  margin-bottom: 8px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.topo-links-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-}
-
-.topo-links-table th {
-  text-align: left;
-  padding: 6px 12px;
-  border-bottom: 2px solid var(--border);
-  color: var(--text-muted);
-  font-weight: 600;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.topo-links-table td {
-  padding: 7px 12px;
-  border-bottom: 1px solid var(--border);
-  vertical-align: middle;
-}
-
-.topo-links-table tr:last-child td { border-bottom: none; }
-.topo-links-table tr:hover td { background: var(--surface-hover, #f8fafc); }
-
-.topo-port {
-  font-family: monospace;
-  font-size: 13px;
-  font-weight: 600;
-  color: #0063a3;
-  white-space: nowrap;
-}
-
-.topo-arrow {
-  text-align: center;
-  color: var(--text-muted);
-  font-size: 16px;
-}
-
-.topo-ip {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-
 
 .legend-item {
   display: flex;
