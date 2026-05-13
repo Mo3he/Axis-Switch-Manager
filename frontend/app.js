@@ -13,18 +13,27 @@ let allSwitches = [];
 // Auto-refresh timers
 let _dashTimer = null;
 let _detailTimer = null;
-const DASHBOARD_INTERVAL = 30000;  // 30 s
-const DETAIL_INTERVAL = 15000;     // 15 s
+const DEFAULT_DASH_INTERVAL = 5000;
+const DEFAULT_DETAIL_INTERVAL = 5000;
+
+function _getSettings() {
+  return {
+    dashInterval: parseInt(localStorage.getItem("dashInterval") || DEFAULT_DASH_INTERVAL),
+    detailInterval: parseInt(localStorage.getItem("detailInterval") || DEFAULT_DETAIL_INTERVAL),
+  };
+}
 
 function _startDashTimer() {
   _stopAllTimers();
+  const { dashInterval } = _getSettings();
   _dashTimer = setInterval(() => {
     if (currentView === "dashboard") refreshDashboard();
-  }, DASHBOARD_INTERVAL);
+  }, dashInterval);
 }
 
 function _startDetailTimer() {
   _stopAllTimers();
+  const { detailInterval } = _getSettings();
   _detailTimer = setInterval(() => {
     if (currentView === "switch-detail" && currentSwitchId) {
       // Only refresh live-data tabs, not the configure tab
@@ -33,7 +42,7 @@ function _startDetailTimer() {
       loadPoe(currentSwitchId);
       loadTraffic(currentSwitchId);
     }
-  }, DETAIL_INTERVAL);
+  }, detailInterval);
 }
 
 function _stopAllTimers() {
@@ -67,6 +76,7 @@ document.querySelectorAll(".nav-link").forEach(link => {
     const view = link.dataset.view;
     if (view === "dashboard") { refreshDashboard(); _startDashTimer(); }
     else if (view === "switches") { loadSwitchesList(); _stopAllTimers(); }
+    else if (view === "settings") { loadSettingsView(); _stopAllTimers(); }
     showView(view);
   });
 });
@@ -1307,6 +1317,34 @@ async function applyBulkConfig() {
   } catch {
     progressEl.style.display = "none";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+function loadSettingsView() {
+  const { dashInterval, detailInterval } = _getSettings();
+  document.getElementById("setting-dash-interval").value = dashInterval / 1000;
+  document.getElementById("setting-detail-interval").value = detailInterval / 1000;
+}
+
+function saveSettings() {
+  const dashSecs = Math.max(5, parseInt(document.getElementById("setting-dash-interval").value) || 5);
+  const detailSecs = Math.max(5, parseInt(document.getElementById("setting-detail-interval").value) || 5);
+  localStorage.setItem("dashInterval", dashSecs * 1000);
+  localStorage.setItem("detailInterval", detailSecs * 1000);
+  // Restart active timer with new interval
+  if (currentView === "dashboard") _startDashTimer();
+  else if (currentView === "switch-detail") _startDetailTimer();
+  toast("Settings saved", "success");
+}
+
+function resetSettings() {
+  localStorage.removeItem("dashInterval");
+  localStorage.removeItem("detailInterval");
+  loadSettingsView();
+  toast("Reset to defaults (5s)", "success");
 }
 
 // ---------------------------------------------------------------------------
