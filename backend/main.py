@@ -107,6 +107,10 @@ async def _switch_session(switch: dict):
             raise HTTPException(status_code=503, detail=f"Cannot connect to {switch['ip']}")
         yield client
     finally:
+        try:
+            await client.get("/config/logout")
+        except Exception:
+            pass
         await client.aclose()
 
 
