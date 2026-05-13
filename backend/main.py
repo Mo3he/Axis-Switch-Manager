@@ -1585,6 +1585,7 @@ async def get_topology():
 
     extra_nodes: dict[str, dict] = {}
     edges: list[dict] = []
+    edge_idx: dict[tuple, int] = {}
     seen_edge_keys: set[tuple] = set()
     snmp_status: dict[str, str] = {}
 
@@ -1612,12 +1613,20 @@ async def get_topology():
             edge_key = tuple(sorted([sw["id"], remote_id]))
             if edge_key not in seen_edge_keys:
                 seen_edge_keys.add(edge_key)
+                edge_idx[edge_key] = len(edges)
                 edges.append({
                     "source": sw["id"],
                     "target": remote_id,
                     "source_port": nb["local_port"],
                     "target_port": nb["remote_port_desc"] or nb["remote_port_id"],
                 })
+            else:
+                # Update with the actual local port number from the reverse direction
+                idx = edge_idx[edge_key]
+                e = edges[idx]
+                if e["source"] == remote_id:
+                    # This switch (sw) is the target in the stored edge
+                    e["target_port"] = str(nb["local_port"])
 
     return {
         "nodes": nodes + list(extra_nodes.values()),

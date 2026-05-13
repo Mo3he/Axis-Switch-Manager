@@ -1385,8 +1385,10 @@ let _topoGraph = null;
 async function loadTopologyView() {
   const statusEl = document.getElementById("topology-status");
   const canvas   = document.getElementById("topology-canvas");
+  const linksEl  = document.getElementById("topology-links");
 
   if (_topoGraph) { _topoGraph.destroy(); _topoGraph = null; }
+  if (linksEl) linksEl.innerHTML = "";
 
   statusEl.textContent = "Loading topology data via SNMP / LLDP…";
   canvas.style.opacity = "0.3";
@@ -1403,51 +1405,98 @@ async function loadTopologyView() {
   canvas.style.opacity = "1";
   const { nodes, edges, snmp_status } = data;
 
-  // Build human-readable status line
+  // Status bar
   const noLldp  = Object.values(snmp_status).filter(s => s === "no_lldp").length;
   const errored = Object.values(snmp_status).filter(s => s.startsWith("error")).length;
   const msgs = [];
-  if (noLldp)  msgs.push(`${noLldp} switch${noLldp  > 1 ? "es" : ""} returned no LLDP data (SNMP or LLDP may be disabled)`);
+  if (noLldp)  msgs.push(`${noLldp} switch${noLldp > 1 ? "es" : ""} returned no LLDP data`);
   if (errored) msgs.push(`${errored} switch${errored > 1 ? "es" : ""} unreachable via SNMP`);
-  if (!edges.length && !msgs.length) msgs.push("No connections found — make sure SNMP is enabled on each switch");
-  statusEl.textContent = msgs.length ? msgs.join("  ·  ") : `${nodes.length} device${nodes.length !== 1 ? "s" : ""}, ${edges.length} link${edges.length !== 1 ? "s" : ""}`;
+  if (!edges.length && !msgs.length) msgs.push("No links found — ensure SNMP is enabled and LLDP neighbors have formed");
+  statusEl.textContent = msgs.length
+    ? msgs.join("  ·  ")
+    : `${nodes.length} device${nodes.length !== 1 ? "s" : ""}, ${edges.length} link${edges.length !== 1 ? "s" : ""}`;
 
   if (!nodes.length) { statusEl.textContent = "No switches configured."; return; }
 
-  _topoGraph = new ForceGraph(canvas, nodes, edges);
+  _topoGraph = new TopologyGraph(canvas, nodes, edges);
+
+  // Build connection table
+  if (linksEl && edges.length) {
+    const nodeById = Object.fromEntries(nodes.map(n => [n.id, n]));
+    const rows = edges.map(e => {
+      const src = nodeById[e.source] || { name: e.source, ip: "" };
+      const tgt = nodeById[e.target] || { name: e.target, ip: "" };
+      const sp = e.source_port != null ? `Port ${e.source_port}` : "—";
+      const tp = _parsePortLabel(e.target_port);
+      return `<tr>
+        <td><strong>${src.name}</strong><br><span class="topo-ip">${src.ip}</span></td>
+        <td class="topo-port">${sp}</td>
+        <td class="topo-arrow">↔</td>
+        <td class="topo-port">${tp}</td>
+        <td><strong>${tgt.name}</strong><br><span class="topo-ip">${tgt.ip}</span></td>
+      </tr>`;
+    }).join("");
+    linksEl.innerHTML = `
+      <div class="topo-links-title">Connections (${edges.length})</div>
+      <table class="topo-links-table">
+        <thead><tr><th>Switch A</th><th>Port A</th><th></th><th>Port B</th><th>Switch B</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
 }
 
+function _parsePortLabel(portStr) {
+  if (portStr == null || portStr === "") return "—";
+  const s = String(portStr).trim();
+  if (/^\d+$/.test(s)) return `Port ${s}`;
+  const m = s.match(/(\d+)$/);
+  return m ? `Port ${m[1]}` : s;
+}
 
-class ForceGraph {
+class TopologyGraph {
+  static NODE_W = 192;
+  static NODE_H = 74;
+  static PORTS  = 24;
+
   constructor(canvas, nodes, edges) {
     this.canvas = canvas;
     this.ctx    = canvas.getContext("2d");
+    const rect  = canvas.getBoundingClientRect();
+    canvas.width  = rect.width  || 960;
+    canvas.height = rect.height || 540;
+    this.W = canvas.width;
+    this.H = canvas.height;
 
-    // Size canvas pixels to its CSS layout size
-    const rect = canvas.getBoundingClientRect();
-    canvas.width  = rect.width  || 900;
-    canvas.height = rect.height || 520;
+    // Grid initial layout
+    const cols  = Math.max(3, Math.ceil(Math.sqrt(nodes.length * 1.6)));
+    const gapX  = this.W / (cols + 0.8);
+    const rows  = Math.ceil(nodes.length / cols);
+    const gapY  = (this.H - 60) / (rows + 0.5);
 
-    const W = canvas.width, H = canvas.height;
-    const cx = W / 2, cy = H / 2;
-
-    // Place nodes in a circle for initial layout
-    this.nodes = nodes.map((n, i) => {
-      const angle = (2 * Math.PI * i) / nodes.length;
-      const r = Math.min(W, H) * 0.28;
-      return { ...n, x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle), vx: 0, vy: 0, fixed: false };
-    });
+    this.nodes = nodes.map((n, i) => ({
+      ...n,
+      w: TopologyGraph.NODE_W,
+      h: TopologyGraph.NODE_H,
+      x: gapX * ((i % cols) + 1) + (Math.random() - 0.5) * 10,
+      y: 60 + gapY * (Math.floor(i / cols) + 0.8),
+      vx: 0, vy: 0, fixed: false,
+    }));
     this.nodeById = Object.fromEntries(this.nodes.map(n => [n.id, n]));
-    this.edges    = edges;
 
-    this.dragging = null;
-    this.hovering = null;
-    this._animId  = null;
-    this._alpha   = 1.0;
+    // Pre-parse port numbers on edges
+    this.edges = edges.map(e => ({
+      ...e,
+      srcPortNum: Number.isInteger(e.source_port) ? e.source_port : parseInt(e.source_port, 10) || null,
+      tgtPortNum: this._parsePortNum(e.target_port),
+    }));
 
-    // Pre-settle physics before first paint
-    for (let i = 0; i < 200; i++) this._tick(0.9);
+    this.dragging    = null;
+    this.hovering    = null;
+    this.hoveredEdge = null;
+    this._animId     = null;
+    this._alpha      = 1.0;
 
+    for (let i = 0; i < 180; i++) this._tick(0.85);
     this._setupEvents();
     this._animate();
 
@@ -1455,76 +1504,77 @@ class ForceGraph {
       const r = canvas.getBoundingClientRect();
       canvas.width  = r.width;
       canvas.height = r.height;
+      this.W = canvas.width;
+      this.H = canvas.height;
     };
     window.addEventListener("resize", this._onResize);
   }
 
+  _parsePortNum(portStr) {
+    if (portStr == null || portStr === "") return null;
+    const s = String(portStr).trim();
+    if (/^\d+$/.test(s)) return parseInt(s, 10);
+    const m = s.match(/(\d+)$/);
+    return m ? parseInt(m[1], 10) : null;
+  }
+
+  _portPos(node, portNum) {
+    const t  = ((portNum || 1) - 1) / (TopologyGraph.PORTS - 1);
+    const px = (node.x - node.w / 2 + 5) + t * (node.w - 10);
+    return { x: px, y: node.y + node.h / 2 };
+  }
+
   _tick(alpha) {
-    const nodes = this.nodes;
-    const W = this.canvas.width, H = this.canvas.height;
+    const { nodes } = this;
+    const W = this.W, H = this.H;
     const cx = W / 2, cy = H / 2;
-    const REPULSION  = 5000;
-    const SPRING_LEN = 190;
-    const SPRING_K   = 0.035;
-    const GRAVITY    = 0.022;
-    const DAMPING    = 0.72;
+    const REPULSION  = 14000;
+    const SPRING_LEN = Math.min(W, H) * 0.32;
+    const SPRING_K   = 0.022;
+    const GRAVITY    = 0.007;
+    const DAMPING    = 0.74;
 
     for (const n of nodes) { n.fx = 0; n.fy = 0; }
-
-    // Gravity toward centre
-    for (const n of nodes) {
-      n.fx += (cx - n.x) * GRAVITY;
-      n.fy += (cy - n.y) * GRAVITY;
-    }
-
-    // Node-node repulsion (O(n²) — fine for ≤100 nodes)
+    for (const n of nodes) { n.fx += (cx - n.x) * GRAVITY; n.fy += (cy - n.y) * GRAVITY; }
     for (let i = 0; i < nodes.length; i++) {
       for (let j = i + 1; j < nodes.length; j++) {
-        const dx = nodes[j].x - nodes[i].x;
-        const dy = nodes[j].y - nodes[i].y;
-        const d2 = dx * dx + dy * dy || 1;
+        const dx = nodes[j].x - nodes[i].x, dy = nodes[j].y - nodes[i].y;
+        const d2 = Math.max(dx * dx + dy * dy, 1);
         const d  = Math.sqrt(d2);
         const f  = REPULSION / d2;
-        const fx = (dx / d) * f, fy = (dy / d) * f;
+        const fx = dx / d * f, fy = dy / d * f;
         nodes[i].fx -= fx; nodes[i].fy -= fy;
         nodes[j].fx += fx; nodes[j].fy += fy;
       }
     }
-
-    // Spring forces along edges
     for (const e of this.edges) {
       const s = this.nodeById[e.source], t = this.nodeById[e.target];
       if (!s || !t) continue;
       const dx = t.x - s.x, dy = t.y - s.y;
       const d  = Math.sqrt(dx * dx + dy * dy) || 1;
       const f  = (d - SPRING_LEN) * SPRING_K;
-      const fx = (dx / d) * f, fy = (dy / d) * f;
+      const fx = dx / d * f, fy = dy / d * f;
       s.fx += fx; s.fy += fy;
       t.fx -= fx; t.fy -= fy;
     }
-
-    // Soft boundary walls
-    const PAD = 80;
+    const PAD = 110;
     for (const n of nodes) {
-      if (n.x < PAD)         n.fx += (PAD - n.x) * 0.4;
-      if (n.x > W - PAD)     n.fx += (W - PAD - n.x) * 0.4;
-      if (n.y < PAD)         n.fy += (PAD - n.y) * 0.4;
-      if (n.y > H - PAD)     n.fy += (H - PAD - n.y) * 0.4;
+      if (n.x < PAD)      n.fx += (PAD - n.x) * 0.5;
+      if (n.x > W - PAD)  n.fx += (W - PAD - n.x) * 0.5;
+      if (n.y < PAD)      n.fy += (PAD - n.y) * 0.5;
+      if (n.y > H - PAD)  n.fy += (H - PAD - n.y) * 0.5;
     }
-
-    // Integrate
     for (const n of nodes) {
       if (n.fixed) continue;
       n.vx = (n.vx + n.fx * alpha) * DAMPING;
       n.vy = (n.vy + n.fy * alpha) * DAMPING;
-      n.x += n.vx;
-      n.y += n.vy;
+      n.x += n.vx; n.y += n.vy;
     }
   }
 
   _draw() {
-    const ctx = this.ctx;
-    const W = this.canvas.width, H = this.canvas.height;
+    const { ctx } = this;
+    const W = this.W, H = this.H;
     ctx.clearRect(0, 0, W, H);
 
     // Subtle grid
@@ -1533,80 +1583,152 @@ class ForceGraph {
     for (let x = 0; x < W; x += 44) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
     for (let y = 0; y < H; y += 44) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
 
-    // Edges
+    // Pre-compute connected ports per node
+    const connPorts = {};
     for (const e of this.edges) {
-      const s = this.nodeById[e.source], t = this.nodeById[e.target];
-      if (!s || !t) continue;
-      const hov = this.hovering && (this.hovering.id === e.source || this.hovering.id === e.target);
-      const dx = t.x - s.x, dy = t.y - s.y;
-      const len = Math.sqrt(dx * dx + dy * dy) || 1;
-      const ux = dx / len, uy = dy / len;
-
-      ctx.beginPath();
-      ctx.moveTo(s.x, s.y);
-      ctx.lineTo(t.x, t.y);
-      ctx.strokeStyle = hov ? "#0063a3" : "#cbd5e1";
-      ctx.lineWidth   = hov ? 2.5 : 1.5;
-      ctx.stroke();
-
-      // Port labels (near each endpoint)
-      ctx.font = "bold 10px system-ui, sans-serif";
-      ctx.textAlign = "center";
-      const OFFSET = 42;
-      if (e.source_port) {
-        ctx.fillStyle = hov ? "#0063a3" : "#64748b";
-        ctx.fillText(`P${e.source_port}`, s.x + ux * OFFSET, s.y + uy * OFFSET - 6);
-      }
-      if (e.target_port) {
-        const lbl = String(e.target_port).length <= 6 ? `P${e.target_port}` : String(e.target_port).slice(0, 8);
-        ctx.fillStyle = hov ? "#0063a3" : "#64748b";
-        ctx.fillText(lbl, t.x - ux * OFFSET, t.y - uy * OFFSET - 6);
-      }
+      if (!connPorts[e.source]) connPorts[e.source] = new Set();
+      if (!connPorts[e.target]) connPorts[e.target] = new Set();
+      if (e.srcPortNum) connPorts[e.source].add(e.srcPortNum);
+      if (e.tgtPortNum) connPorts[e.target].add(e.tgtPortNum);
     }
 
-    // Nodes
-    const R = 34;
-    for (const n of this.nodes) {
-      const hov = this.hovering === n;
-      ctx.shadowColor = "rgba(0,0,0,0.18)";
-      ctx.shadowBlur  = hov ? 18 : 8;
+    // Draw edges first (behind nodes)
+    for (const e of this.edges) this._drawEdge(e);
 
-      // Circle
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, R, 0, Math.PI * 2);
-      ctx.fillStyle   = n.managed ? "#0063a3" : "#94a3b8";
-      ctx.fill();
-      ctx.strokeStyle = hov ? "#bfdbfe" : "#ffffff";
-      ctx.lineWidth   = hov ? 3 : 2;
-      ctx.stroke();
-      ctx.shadowBlur  = 0;
+    // Draw nodes on top
+    for (const n of this.nodes) this._drawNode(n, connPorts[n.id] || new Set());
 
-      // Switch icon: 3 horizontal bars + 2 dots (like sidebar logo)
-      ctx.fillStyle = "rgba(255,255,255,0.95)";
-      for (let row = 0; row < 3; row++) {
-        const barY = n.y - 8 + row * 6;
-        ctx.fillRect(n.x - 11, barY, 22, 2.5);
+    ctx.textBaseline = "alphabetic";
+  }
+
+  _drawEdge(e) {
+    const { ctx } = this;
+    const s = this.nodeById[e.source], t = this.nodeById[e.target];
+    if (!s || !t) return;
+
+    const isHov = this.hoveredEdge === e ||
+                  (this.hovering && (this.hovering.id === e.source || this.hovering.id === e.target));
+
+    const sp = e.srcPortNum ? this._portPos(s, e.srcPortNum) : { x: s.x, y: s.y + s.h / 2 };
+    const tp = e.tgtPortNum ? this._portPos(t, e.tgtPortNum) : { x: t.x, y: t.y + t.h / 2 };
+    const sag = Math.min(130, 45 + Math.abs(sp.x - tp.x) * 0.2 + Math.abs(sp.y - tp.y) * 0.1);
+
+    const lineColor = isHov ? "#0063a3" : "#94a3b8";
+
+    // Port connector dots
+    ctx.fillStyle = lineColor;
+    ctx.beginPath(); ctx.arc(sp.x, sp.y, 3.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(tp.x, tp.y, 3.5, 0, Math.PI * 2); ctx.fill();
+
+    // Bezier cable (U-shape downward)
+    ctx.beginPath();
+    ctx.moveTo(sp.x, sp.y);
+    ctx.bezierCurveTo(sp.x, sp.y + sag, tp.x, tp.y + sag, tp.x, tp.y);
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth   = isHov ? 2.5 : 1.5;
+    ctx.stroke();
+
+    // Midpoint label "P5 ↔ P3"
+    // Bezier midpoint at t=0.5: x=(sp.x+tp.x)/2, y=(sp.y+tp.y)/2 + 0.75*sag
+    const midX  = (sp.x + tp.x) / 2;
+    const midY  = (sp.y + tp.y) / 2 + sag * 0.75;
+    const label = `P${e.srcPortNum ?? "?"} ↔ P${e.tgtPortNum ?? "?"}`;
+
+    ctx.font = "bold 10px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const tw = ctx.measureText(label).width + 12;
+    ctx.fillStyle   = isHov ? "#0063a3" : "#f1f5f9";
+    ctx.strokeStyle = isHov ? "#0063a3" : "#cbd5e1";
+    ctx.lineWidth   = 1;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(midX - tw / 2, midY - 9, tw, 18, 4);
+    else               ctx.rect(midX - tw / 2, midY - 9, tw, 18);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = isHov ? "#ffffff" : "#475569";
+    ctx.fillText(label, midX, midY);
+  }
+
+  _drawNode(n, connPorts) {
+    const { ctx } = this;
+    const hov = this.hovering === n ||
+                (this.hoveredEdge && (this.hoveredEdge.source === n.id || this.hoveredEdge.target === n.id));
+    const x = n.x - n.w / 2, y = n.y - n.h / 2;
+    const PORT_ROW_H = 20;
+    const headerH    = n.h - PORT_ROW_H;
+
+    ctx.shadowColor   = "rgba(0,0,0,0.20)";
+    ctx.shadowBlur    = hov ? 22 : 8;
+    ctx.shadowOffsetY = 2;
+
+    // Header
+    ctx.fillStyle = n.managed ? (hov ? "#1d4ed8" : "#1e3a5f") : (hov ? "#64748b" : "#334155");
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, y, n.w, headerH, [10, 10, 0, 0]);
+    else               ctx.rect(x, y, n.w, headerH);
+    ctx.fill();
+
+    ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+
+    // Port row
+    ctx.fillStyle = n.managed ? "#0f2340" : "#1e293b";
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, y + headerH, n.w, PORT_ROW_H, [0, 0, 10, 10]);
+    else               ctx.rect(x, y + headerH, n.w, PORT_ROW_H);
+    ctx.fill();
+
+    // Border
+    ctx.strokeStyle = hov ? "#60a5fa" : "rgba(255,255,255,0.12)";
+    ctx.lineWidth   = hov ? 2 : 1;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, y, n.w, n.h, 10);
+    else               ctx.rect(x, y, n.w, n.h);
+    ctx.stroke();
+
+    // Switch icon
+    const ix = x + 10, iy = y + 9;
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    for (let r = 0; r < 3; r++) ctx.fillRect(ix, iy + r * 5, 14, 2);
+    ctx.fillStyle = "#7dd3fc";
+    ctx.beginPath(); ctx.arc(ix + 2, iy + 1, 2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(ix + 2, iy + 6, 2, 0, Math.PI * 2); ctx.fill();
+
+    // Name
+    ctx.fillStyle    = "#ffffff";
+    ctx.font         = `${hov ? "bold " : ""}11px system-ui, sans-serif`;
+    ctx.textAlign    = "left";
+    ctx.textBaseline = "middle";
+    let label = n.name.length > 20 ? n.name.slice(0, 18) + "…" : n.name;
+    ctx.fillText(label, ix + 20, y + 14);
+
+    // IP
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.font = "9px system-ui, sans-serif";
+    ctx.fillText(n.ip || "", ix + 20, y + 27);
+
+    // Port indicators
+    const PC     = TopologyGraph.PORTS;
+    const portY  = y + headerH + 3;
+    const portW  = (n.w - 8) / PC;
+    const portH  = PORT_ROW_H - 6;
+
+    for (let p = 1; p <= PC; p++) {
+      const px        = x + 4 + (p - 1) * portW;
+      const connected = connPorts.has(p);
+      ctx.fillStyle   = connected ? "#22c55e" : "rgba(255,255,255,0.10)";
+      ctx.fillRect(px + 0.5, portY, portW - 1.5, portH);
+
+      // Port number label inside the slot when hovered
+      if (connected && hov) {
+        ctx.fillStyle    = "#ffffff";
+        ctx.font         = "7px system-ui, sans-serif";
+        ctx.textAlign    = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(p, px + portW / 2, portY + portH / 2);
       }
-      ctx.fillStyle = n.managed ? "#7dd3fc" : "#e2e8f0";
-      ctx.beginPath(); ctx.arc(n.x - 9, n.y - 7, 2.2, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(n.x - 9, n.y - 1, 2.2, 0, Math.PI * 2); ctx.fill();
-
-      // Name label
-      ctx.fillStyle = "#1e293b";
-      ctx.font = `${hov ? "bold " : ""}12px system-ui, sans-serif`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "top";
-      let label = n.name;
-      if (label.length > 22) label = label.slice(0, 20) + "…";
-      ctx.fillText(label, n.x, n.y + R + 5, 150);
-
-      if (n.ip) {
-        ctx.fillStyle = "#64748b";
-        ctx.font = "10px system-ui, sans-serif";
-        ctx.fillText(n.ip, n.x, n.y + R + 21, 150);
-      }
-      ctx.textBaseline = "alphabetic";
     }
+    ctx.textBaseline = "alphabetic";
   }
 
   _animate() {
@@ -1622,8 +1744,22 @@ class ForceGraph {
 
   _nodeAt(x, y) {
     for (const n of this.nodes) {
-      const dx = n.x - x, dy = n.y - y;
-      if (dx * dx + dy * dy <= 34 * 34) return n;
+      if (x >= n.x - n.w / 2 && x <= n.x + n.w / 2 &&
+          y >= n.y - n.h / 2 && y <= n.y + n.h / 2) return n;
+    }
+    return null;
+  }
+
+  _edgeLabelAt(x, y) {
+    for (const e of this.edges) {
+      const s = this.nodeById[e.source], t = this.nodeById[e.target];
+      if (!s || !t) continue;
+      const sp  = e.srcPortNum ? this._portPos(s, e.srcPortNum) : { x: s.x, y: s.y + s.h / 2 };
+      const tp  = e.tgtPortNum ? this._portPos(t, e.tgtPortNum) : { x: t.x, y: t.y + t.h / 2 };
+      const sag = Math.min(130, 45 + Math.abs(sp.x - tp.x) * 0.2 + Math.abs(sp.y - tp.y) * 0.1);
+      const midX = (sp.x + tp.x) / 2, midY = (sp.y + tp.y) / 2 + sag * 0.75;
+      const dx = x - midX, dy = y - midY;
+      if (dx * dx + dy * dy < 625) return e;
     }
     return null;
   }
@@ -1639,14 +1775,18 @@ class ForceGraph {
       const r = c.getBoundingClientRect();
       const x = e.clientX - r.left, y = e.clientY - r.top;
       if (this.dragging) { this.dragging.x = x; this.dragging.y = y; }
-      else { this.hovering = this._nodeAt(x, y); c.style.cursor = this.hovering ? "pointer" : "grab"; }
+      else {
+        this.hovering    = this._nodeAt(x, y);
+        this.hoveredEdge = this.hovering ? null : this._edgeLabelAt(x, y);
+        c.style.cursor   = (this.hovering || this.hoveredEdge) ? "pointer" : "grab";
+      }
     });
     c.addEventListener("mouseup", () => {
       if (this.dragging) { this.dragging.fixed = false; this.dragging = null; c.style.cursor = "grab"; }
     });
     c.addEventListener("mouseleave", () => {
       if (this.dragging) { this.dragging.fixed = false; this.dragging = null; }
-      this.hovering = null;
+      this.hovering = null; this.hoveredEdge = null;
     });
   }
 

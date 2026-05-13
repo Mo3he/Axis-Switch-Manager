@@ -800,6 +800,67 @@ select.priority-sel {
   flex-wrap: wrap;
 }
 
+/* ---- Topology connection table ---- */
+#topology-links {
+  margin-top: 16px;
+}
+
+.topo-links-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.topo-links-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.topo-links-table th {
+  text-align: left;
+  padding: 6px 12px;
+  border-bottom: 2px solid var(--border);
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.topo-links-table td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.topo-links-table tr:last-child td { border-bottom: none; }
+.topo-links-table tr:hover td { background: var(--surface-hover, #f8fafc); }
+
+.topo-port {
+  font-family: monospace;
+  font-size: 13px;
+  font-weight: 600;
+  color: #0063a3;
+  white-space: nowrap;
+}
+
+.topo-arrow {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 16px;
+}
+
+.topo-ip {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+
+
 .legend-item {
   display: flex;
   align-items: center;
