@@ -1,53 +1,82 @@
 # Axis Switch Manager
 
-A central management dashboard for Axis network switches.
+A central management dashboard for Axis network switches. Monitor and configure all your switches from a single web interface.
 
 ## Features
 
-- **Dashboard** - At-a-glance view of all switches with PoE load, uptime, and status
-- **Port Status** - Per-port link state, speed, admin state, and PoE status
-- **PoE Monitoring** - Visual power meters per port with voltage/current details
-- **Traffic Stats** - Rx/Tx packets and bytes per port
-- **Multi-switch** - Manage any number of Axis switches from one interface
+- **Dashboard** - At-a-glance view of all switches with PoE load, uptime, and port status
+- **Network Scan** - Scan a subnet to discover and add multiple switches at once
+- **Port Monitoring** - Per-port link state, speed, admin state, and LLDP neighbour info
+- **PoE Monitoring** - Visual power meters per port with voltage, current, and class details
+- **Traffic Stats** - Rx/Tx packets, bytes, errors, and drops per port
+- **Full Configuration** - Per-switch configuration covering:
+  - System info (name, location, contact)
+  - NTP / time server
+  - Port admin state, flow control, MTU, and descriptions
+  - PoE per-port enable, priority, and power budget
+  - Loop protection (global + per-port action)
+  - VLAN port configuration (access/trunk/hybrid, PVID, allowed VLANs)
+  - Private VLAN / port isolation
+  - Link aggregation status
+- **Bulk Configure** - Apply PoE or port settings across multiple switches at once
 
 ## Supported Switches
 
 - AXIS T8508 (tested)
-- AXIS T8516, T8524 series (SM24TAT2SA and similar)
+- AXIS T8516, T8524 (SM24TAT2SA and similar)
 - Other Axis OEM switches using the same web interface firmware
 
-## Setup
+## Running with Docker (recommended)
+
+### Pull and start
+
+```bash
+docker compose up -d
+```
+
+The app will be available at [http://localhost:8000](http://localhost:8000).
+
+Switch inventory is stored in `backend/switches.json` on the host and mounted into the container, so it persists across updates.
+
+### Build locally instead of pulling
+
+```bash
+docker compose up -d --build
+```
+
+### Docker image
+
+The image is automatically built and published to the GitHub Container Registry on every push to `main`:
+
+```
+ghcr.io/mo3he/axis-switch-manager:latest
+```
+
+## Running without Docker
 
 ### Requirements
 
 - Python 3.11+
-- pip
 
-### Install dependencies
+### Install and run
 
 ```bash
-cd axis-switches-gui
 python3 -m venv .venv
 source .venv/bin/activate
-pip install fastapi "uvicorn[standard]" httpx
-```
-
-### Run
-
-```bash
+pip install -r requirements.txt
 ./start.sh
 ```
 
 Then open [http://localhost:8000](http://localhost:8000) in your browser.
 
-### Add your first switch
+## Adding switches
 
 1. Go to **Switches** in the sidebar
-2. Click **+ Add Switch**
+2. Click **+ Add Switch** to add one manually, or **Scan Network** to discover switches on a subnet
 3. Enter the switch name, IP address, and login credentials
 4. Click **Save**
 
-The dashboard will immediately begin polling the switch for data.
+Switch data is stored in `backend/switches.json`. Copy `backend/switches.json.example` as a starting point.
 
 ## Architecture
 
