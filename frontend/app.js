@@ -129,12 +129,12 @@ async function refreshDashboard() {
     return;
   }
 
-  // Summary cards
+  // Summary cards - update only changed values to avoid repaint
   const online = data.filter(s => s.status === "online").length;
   const totalPoE = data.reduce((sum, s) => sum + s.total_poe_watts, 0);
   const totalActivePorts = data.reduce((sum, s) => sum + s.active_poe_ports, 0);
 
-  summaryEl.innerHTML = `
+  const newSummary = `
     <div class="summary-card">
       <div class="label">Total Switches</div>
       <div class="value">${data.length}</div>
@@ -152,17 +152,16 @@ async function refreshDashboard() {
       <div class="value">${totalActivePorts}</div>
     </div>
   `;
+  if (summaryEl.innerHTML !== newSummary) summaryEl.innerHTML = newSummary;
 
   if (!data.length) {
-    container.innerHTML = `
-      <div class="empty-state">
-        <h3>No switches configured</h3>
-        <p>Go to <a href="#" onclick="loadSwitchesList();showView('switches')">Switches</a> to add your first switch.</p>
-      </div>`;
+    const empty = `<div class="empty-state"><h3>No switches configured</h3><p>Go to <a href="#" onclick="loadSwitchesList();showView('switches')">Switches</a> to add your first switch.</p></div>`;
+    if (container.innerHTML !== empty) container.innerHTML = empty;
     return;
   }
 
-  container.innerHTML = data.map(sw => renderSwitchCard(sw)).join("");
+  const newCards = data.map(sw => renderSwitchCard(sw)).join("");
+  if (container.innerHTML !== newCards) container.innerHTML = newCards;
 }
 
 function renderSwitchCard(sw) {
@@ -340,7 +339,7 @@ async function loadPorts(id) {
     return;
   }
 
-  el.innerHTML = `
+  const newPorts = `
     <div class="ports-table-wrap">
       <table>
         <thead>
@@ -374,6 +373,7 @@ async function loadPorts(id) {
         </tbody>
       </table>
     </div>`;
+  if (el.innerHTML !== newPorts) el.innerHTML = newPorts;
 }
 
 async function loadPoe(id) {
@@ -392,7 +392,7 @@ async function loadPoe(id) {
     return;
   }
 
-  el.innerHTML = `<div class="poe-grid">${ports.map(p => {
+  const newPoe = `<div class="poe-grid">${ports.map(p => {
     const on = p.status && p.status.includes("ON");
     const pct = p.max_power > 0 ? Math.min(100, (p.current_power / p.max_power) * 100) : 0;
     return `
@@ -410,6 +410,7 @@ async function loadPoe(id) {
         </div>
       </div>`;
   }).join("")}</div>`;
+  if (el.innerHTML !== newPoe) el.innerHTML = newPoe;
 }
 
 async function loadTraffic(id) {
@@ -423,7 +424,7 @@ async function loadTraffic(id) {
     return;
   }
 
-  el.innerHTML = `
+  const newTraffic = `
     <div class="traffic-table-wrap">
       <table>
         <thead>
@@ -453,6 +454,7 @@ async function loadTraffic(id) {
         </tbody>
       </table>
     </div>`;
+  if (el.innerHTML !== newTraffic) el.innerHTML = newTraffic;
 }
 
 // ---------------------------------------------------------------------------
