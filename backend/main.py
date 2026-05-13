@@ -1426,8 +1426,37 @@ LLDP_REM_PORT_DESC = "1.0.8802.1.1.2.1.4.1.1.8"
 
 
 async def _snmp_walk(host: str, community: str, base_oid: str) -> list[tuple[str, str]]:
-    """SNMP v2c walk. Supports pysnmp v6 (async) and v4 (sync via thread)."""
-    # --- pysnmp v6 lextudio (async API) ---
+    """SNMP v2c walk. Supports pysnmp v7 (walk_cmd), v6 (nextCmd), and v4 (sync)."""
+    subtree_prefix = base_oid + "."
+
+    # --- pysnmp v7 lextudio (snake_case walk_cmd) ---
+    try:
+        from pysnmp.hlapi.v3arch.asyncio import (  # type: ignore
+            SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
+            ObjectType, ObjectIdentity, walk_cmd,
+        )
+        engine = SnmpEngine()
+        transport = await UdpTransportTarget.create((host, 161), timeout=3, retries=1)
+        results: list[tuple[str, str]] = []
+        async for err_ind, err_status, _, var_binds in walk_cmd(
+            engine,
+            CommunityData(community, mpModel=1),
+            transport,
+            ContextData(),
+            ObjectType(ObjectIdentity(base_oid)),
+        ):
+            if err_ind or err_status:
+                break
+            for oid, val in var_binds:
+                oid_str = str(oid)
+                if not oid_str.startswith(subtree_prefix):
+                    return results
+                results.append((oid_str, val.prettyPrint()))
+        return results
+    except (ImportError, AttributeError):
+        pass
+
+    # --- pysnmp v6 lextudio (camelCase nextCmd) ---
     try:
         from pysnmp.hlapi.v3arch.asyncio import (  # type: ignore
             SnmpEngine, CommunityData, UdpTransportTarget, ContextData,
@@ -1435,7 +1464,7 @@ async def _snmp_walk(host: str, community: str, base_oid: str) -> list[tuple[str
         )
         engine = SnmpEngine()
         transport = await UdpTransportTarget.create((host, 161), timeout=3, retries=1)
-        results: list[tuple[str, str]] = []
+        results2: list[tuple[str, str]] = []
         async for err_ind, err_status, _, var_binds in nextCmd(
             engine,
             CommunityData(community, mpModel=1),
@@ -1447,8 +1476,8 @@ async def _snmp_walk(host: str, community: str, base_oid: str) -> list[tuple[str
             if err_ind or err_status:
                 break
             for oid, val in var_binds:
-                results.append((str(oid), val.prettyPrint()))
-        return results
+                results2.append((str(oid), val.prettyPrint()))
+        return results2
     except (ImportError, AttributeError):
         pass
 
