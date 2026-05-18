@@ -29,7 +29,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SWITCHES_FILE = Path(__file__).parent / "switches.json"
+SWITCHES_FILE   = Path(__file__).parent / "switches.json"
+SNMP_CFG_FILE   = Path(__file__).parent / "snmp_config.json"
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,24 @@ def save_switches(switches: list[dict]) -> None:
     SWITCHES_FILE.write_text(json.dumps(switches, indent=2))
 
 
+_SNMP_CFG_DEFAULTS: dict = {"enabled": False, "seed_ips": [], "community": "public"}
+
+def load_snmp_config() -> dict:
+    if SNMP_CFG_FILE.exists():
+        try:
+            raw = json.loads(SNMP_CFG_FILE.read_text())
+            # Migrate legacy single 'ip' field to seed_ips list
+            if raw.get("ip") and not raw.get("seed_ips"):
+                raw["seed_ips"] = [raw["ip"]]
+            return {**_SNMP_CFG_DEFAULTS, **raw}
+        except Exception:
+            pass
+    return dict(_SNMP_CFG_DEFAULTS)
+
+def save_snmp_config(data: dict) -> None:
+    SNMP_CFG_FILE.write_text(json.dumps(data, indent=2))
+
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -65,6 +84,16 @@ class SwitchUpdate(BaseModel):
     ip: str | None = None
     username: str | None = None
     password: str | None = None
+
+
+class SnmpDiscoveryConfig(BaseModel):
+    enabled: bool
+    seed_ips: list[str] = []
+    community: str = "public"
+
+
+# Legacy alias kept for any direct references
+CoreSwitchConfig = SnmpDiscoveryConfig
 
 
 # ---------------------------------------------------------------------------
@@ -314,9 +343,6 @@ async def update_switch(switch_id: str, payload: SwitchUpdate):
                 sw["password"] = payload.password
             save_switches(switches)
             # Invalidate cached client
-            if switch_id in _http_clients:
-                await _http_clients[switch_id].aclose()
-                del _http_clients[switch_id]
             return {"ok": True}
     raise HTTPException(status_code=404, detail="Switch not found")
 
@@ -328,9 +354,6 @@ async def delete_switch(switch_id: str):
     if len(new_list) == len(switches):
         raise HTTPException(status_code=404, detail="Switch not found")
     save_switches(new_list)
-    if switch_id in _http_clients:
-        await _http_clients[switch_id].aclose()
-        del _http_clients[switch_id]
     return {"ok": True}
 
 
@@ -1417,16 +1440,29 @@ async def bulk_apply(payload: BulkConfigPayload):
 
 
 # ---------------------------------------------------------------------------
-# SNMP / LLDP Topology
+# SNMP walk engine
 # ---------------------------------------------------------------------------
 
-LLDP_REM_SYS_NAME  = "1.0.8802.1.1.2.1.4.1.1.9"
-LLDP_REM_PORT_ID   = "1.0.8802.1.1.2.1.4.1.1.7"
-LLDP_REM_PORT_DESC = "1.0.8802.1.1.2.1.4.1.1.8"
+# Global lock: pysnmp SnmpEngine instances interfere when run concurrently in
+# the same event loop. Serialize all SNMP walks to ensure reliable results.
+_snmp_lock: asyncio.Lock | None = None
+
+
+def _get_snmp_lock() -> asyncio.Lock:
+    global _snmp_lock
+    if _snmp_lock is None:
+        _snmp_lock = asyncio.Lock()
+    return _snmp_lock
 
 
 async def _snmp_walk(host: str, community: str, base_oid: str) -> list[tuple[str, str]]:
     """SNMP v2c walk. Supports pysnmp v7 (walk_cmd), v6 (nextCmd), and v4 (sync)."""
+    async with _get_snmp_lock():
+        return await _snmp_walk_inner(host, community, base_oid)
+
+
+async def _snmp_walk_inner(host: str, community: str, base_oid: str) -> list[tuple[str, str]]:
+    """Internal SNMP walk (called while holding _snmp_lock)."""
     subtree_prefix = base_oid + "."
 
     # --- pysnmp v7 lextudio (snake_case walk_cmd) ---
@@ -1508,8 +1544,42 @@ async def _snmp_walk(host: str, community: str, base_oid: str) -> list[tuple[str
         return []
 
 
-def _lldp_index(oid_str: str, base_oid: str) -> tuple[int, int, int]:
-    """Extract (timeMark, localPort, remIdx) from a LLDP OID string."""
+# ---------------------------------------------------------------------------
+# SNMP helper utilities
+# ---------------------------------------------------------------------------
+
+def _parse_snmp_mac(val: str) -> str | None:
+    """Convert SNMP OctetString prettyPrint output to 'aa:bb:cc:dd:ee:ff' format."""
+    v = val.strip()
+    if v.startswith("0x") and len(v) == 14:
+        return ":".join(v[2+i:4+i].lower() for i in range(0, 12, 2))
+    parts = v.split(":")
+    if len(parts) == 6:
+        try:
+            return ":".join(f"{int(p, 16):02x}" for p in parts)
+        except ValueError:
+            pass
+    import re as _re
+    m = _re.findall(r'\\x([0-9a-fA-F]{2})', v)
+    if len(m) == 6:
+        return ":".join(b.lower() for b in m)
+    return None
+
+
+def _mac_from_fdb_oid(oid_str: str, base_oid: str) -> str | None:
+    """Extract MAC from FDB OID suffix (6 decimal octets appended to base_oid)."""
+    suffix = oid_str[len(base_oid):].lstrip(".")
+    parts = suffix.split(".")
+    if len(parts) < 6:
+        return None
+    try:
+        return ":".join(f"{int(p):02x}" for p in parts[-6:])
+    except ValueError:
+        return None
+
+
+def _lldp_key(oid_str: str, base_oid: str) -> tuple[int, int, int]:
+    """Extract (timeMark, localPortNum, remIndex) from a LLDP OID string."""
     suffix = oid_str[len(base_oid):].lstrip(".")
     parts = suffix.split(".")
     try:
@@ -1518,121 +1588,1010 @@ def _lldp_index(oid_str: str, base_oid: str) -> tuple[int, int, int]:
         return 0, 0, 0
 
 
-async def _get_lldp_neighbors(sw: dict) -> list[dict]:
-    """Return LLDP neighbor list for one switch via SNMP."""
-    try:
-        raw = await _fetch(sw, "config/snmp")
-        snmp_conf = parse_snmp(raw)
-    except Exception:
-        snmp_conf = {"enabled": False, "community_ro": "public"}
+# ---------------------------------------------------------------------------
+# SNMP LLDP / FDB / ARP helpers
+# ---------------------------------------------------------------------------
 
-    if not snmp_conf.get("enabled"):
-        return []
+_LLDP_REM_CHASSIS_SUBTYPE = "1.0.8802.1.1.2.1.4.1.1.4"
+_LLDP_REM_CHASSIS_ID      = "1.0.8802.1.1.2.1.4.1.1.5"
+_LLDP_REM_PORT_ID         = "1.0.8802.1.1.2.1.4.1.1.7"
+_LLDP_REM_PORT_DESC       = "1.0.8802.1.1.2.1.4.1.1.8"
+_LLDP_REM_SYS_NAME        = "1.0.8802.1.1.2.1.4.1.1.9"
+_LLDP_LOC_PORT_DESC       = "1.0.8802.1.1.2.1.3.7.1.4"
+_LLDP_REM_MGMT_ADDR       = "1.0.8802.1.1.2.1.4.2.1.3"
+_IF_DESCR_OID             = "1.3.6.1.2.1.2.2.1.2"
+_SYS_NAME_OID             = "1.3.6.1.2.1.1.5"
+_SYS_DESCR_OID            = "1.3.6.1.2.1.1.1"
+_ARP_OID                  = "1.3.6.1.2.1.4.22.1.2"
+_FDB_PORT_OID             = "1.3.6.1.2.1.17.4.3.1.2"
+_FDB_STATUS_OID           = "1.3.6.1.2.1.17.4.3.1.3"
+_BRIDGE_PORT_IFIDX_OID    = "1.3.6.1.2.1.17.1.4.1.2"
 
-    community = snmp_conf.get("community_ro", "public") or "public"
-    host = sw["ip"]
 
-    sys_names_res, port_ids_res, port_desc_res = await asyncio.gather(
-        _snmp_walk(host, community, LLDP_REM_SYS_NAME),
-        _snmp_walk(host, community, LLDP_REM_PORT_ID),
-        _snmp_walk(host, community, LLDP_REM_PORT_DESC),
-        return_exceptions=True,
-    )
+async def _snmp_get_ifnames(ip: str, community: str) -> dict[int, str]:
+    """Walk ifDescr -> {ifIndex: ifName}."""
+    rows = await _snmp_walk(ip, community, _IF_DESCR_OID)
+    result: dict[int, str] = {}
+    for oid, val in rows:
+        idx = oid.rsplit(".", 1)[-1]
+        if idx.isdigit():
+            result[int(idx)] = val
+    return result
 
-    sys_name_map:  dict[tuple, str] = {}
-    port_id_map:   dict[tuple, str] = {}
-    port_desc_map: dict[tuple, str] = {}
 
-    if not isinstance(sys_names_res, Exception):
-        for oid, val in sys_names_res:
-            sys_name_map[_lldp_index(oid, LLDP_REM_SYS_NAME)] = val
-    if not isinstance(port_ids_res, Exception):
-        for oid, val in port_ids_res:
-            port_id_map[_lldp_index(oid, LLDP_REM_PORT_ID)] = val
-    if not isinstance(port_desc_res, Exception):
-        for oid, val in port_desc_res:
-            port_desc_map[_lldp_index(oid, LLDP_REM_PORT_DESC)] = val
+async def _snmp_get_arp(ip: str, community: str) -> dict[str, str]:
+    """Walk ARP table -> {mac_str: ip_str}."""
+    rows = await _snmp_walk(ip, community, _ARP_OID)
+    result: dict[str, str] = {}
+    for oid, val in rows:
+        suffix = oid[len(_ARP_OID):].lstrip(".")
+        parts = suffix.split(".")
+        if len(parts) >= 5:
+            nbr_ip = ".".join(parts[-4:])
+            mac = _parse_snmp_mac(val)
+            if mac and nbr_ip:
+                result[mac] = nbr_ip
+    return result
+
+
+async def _snmp_get_lldp_neighbors(ip: str, community: str) -> list[dict]:
+    """
+    Walk LLDP remote neighbor tables. Returns list of dicts:
+    {lldp_key, local_port_num, chassis_subtype, chassis_id,
+     remote_port_id, remote_port_desc, remote_sys_name}
+    """
+    cols = {
+        "chassis_subtype": _LLDP_REM_CHASSIS_SUBTYPE,
+        "chassis_id":      _LLDP_REM_CHASSIS_ID,
+        "port_id":         _LLDP_REM_PORT_ID,
+        "port_desc":       _LLDP_REM_PORT_DESC,
+        "sys_name":        _LLDP_REM_SYS_NAME,
+    }
+    data: dict[tuple, dict] = {}
+    for col, base in cols.items():
+        rows = await _snmp_walk(ip, community, base)
+        for oid, val in rows:
+            key = _lldp_key(oid, base)
+            if key == (0, 0, 0):
+                continue
+            data.setdefault(key, {})[col] = val
 
     neighbors = []
-    for key, sys_name in sys_name_map.items():
-        if not sys_name or sys_name.strip().lower() in ("", "noname"):
+    for key, vals in data.items():
+        if not vals.get("sys_name", "").strip():
             continue
-        _, local_port, _ = key
+        _, local_port_num, _ = key
+        sub_raw = vals.get("chassis_subtype", "0")
         neighbors.append({
-            "local_port": local_port,
-            "remote_sys_name": sys_name.strip(),
-            "remote_port_id": port_id_map.get(key, ""),
-            "remote_port_desc": port_desc_map.get(key, ""),
+            "lldp_key":         key,
+            "local_port_num":   local_port_num,
+            "chassis_subtype":  int(sub_raw) if sub_raw.isdigit() else 0,
+            "chassis_id":       vals.get("chassis_id", ""),
+            "remote_port_id":   vals.get("port_id", ""),
+            "remote_port_desc": vals.get("port_desc", ""),
+            "remote_sys_name":  vals.get("sys_name", "").strip(),
         })
     return neighbors
 
 
+async def _snmp_get_lldp_mgmt_ips(ip: str, community: str) -> dict[tuple, str]:
+    """
+    Walk lldpRemManAddrTable -> {(timeMark, localPort, remIdx): mgmt_ip_str}.
+    IPv4 address is encoded in the OID suffix after addrSubtype=1.
+    """
+    rows = await _snmp_walk(ip, community, _LLDP_REM_MGMT_ADDR)
+    result: dict[tuple, str] = {}
+    for oid, _val in rows:
+        suffix = oid[len(_LLDP_REM_MGMT_ADDR):].lstrip(".")
+        parts = suffix.split(".")
+        if len(parts) < 8:
+            continue
+        try:
+            time_mark  = int(parts[0])
+            local_port = int(parts[1])
+            rem_idx    = int(parts[2])
+            addr_sub   = int(parts[3])
+            if addr_sub == 1 and len(parts) >= 8:   # IPv4
+                mgmt_ip = ".".join(parts[4:8])
+                key = (time_mark, local_port, rem_idx)
+                if key not in result:
+                    result[key] = mgmt_ip
+        except (ValueError, IndexError):
+            pass
+    return result
+
+
+async def _snmp_get_lldp_local_port_names(ip: str, community: str) -> dict[int, str]:
+    """Walk lldpLocPortDesc -> {lldpPortNum: portDescription}."""
+    rows = await _snmp_walk(ip, community, _LLDP_LOC_PORT_DESC)
+    result: dict[int, str] = {}
+    for oid, val in rows:
+        suffix = oid[len(_LLDP_LOC_PORT_DESC):].lstrip(".")
+        if suffix.isdigit():
+            result[int(suffix)] = val
+    return result
+
+
+async def _snmp_get_fdb(
+    ip: str, community: str, if_map: dict[int, str]
+) -> dict[str, list[str]]:
+    """
+    Walk FDB -> {port_name: [mac_str, ...]} for learned entries only (status=3).
+    """
+    bp_rows, fp_rows, fs_rows = await asyncio.gather(
+        _snmp_walk(ip, community, _BRIDGE_PORT_IFIDX_OID),
+        _snmp_walk(ip, community, _FDB_PORT_OID),
+        _snmp_walk(ip, community, _FDB_STATUS_OID),
+        return_exceptions=True,
+    )
+
+    bp_to_if: dict[int, int] = {}
+    if not isinstance(bp_rows, Exception):
+        for oid, val in bp_rows:
+            p = oid.rsplit(".", 1)[-1]
+            if p.isdigit() and val.isdigit():
+                bp_to_if[int(p)] = int(val)
+
+    fdb_status: dict[str, int] = {}
+    if not isinstance(fs_rows, Exception):
+        for oid, val in fs_rows:
+            mac = _mac_from_fdb_oid(oid, _FDB_STATUS_OID)
+            if mac:
+                try:
+                    fdb_status[mac] = int(val)
+                except ValueError:
+                    pass
+
+    result: dict[str, list[str]] = {}
+    if not isinstance(fp_rows, Exception):
+        for oid, val in fp_rows:
+            mac = _mac_from_fdb_oid(oid, _FDB_PORT_OID)
+            if not mac or not val.isdigit():
+                continue
+            # Skip non-learned entries only when status data is available.
+            # If the status walk failed (fdb_status empty), include everything.
+            if fdb_status and fdb_status.get(mac, 0) != 3:
+                continue
+            bp = int(val)
+            if_idx = bp_to_if.get(bp)
+            port_name = if_map.get(if_idx, f"port{bp}") if if_idx else f"bp{bp}"
+            result.setdefault(port_name, []).append(mac)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SNMP network auto-discovery
+# ---------------------------------------------------------------------------
+
+async def _discover_one_switch(ip: str, community: str) -> dict | None:
+    """
+    Query a single switch via SNMP: sysInfo, LLDP neighbors, ifNames, ARP, FDB.
+    Returns None if SNMP is unreachable.
+    """
+    sys_name_rows, sys_descr_rows = await asyncio.gather(
+        _snmp_walk(ip, community, _SYS_NAME_OID),
+        _snmp_walk(ip, community, _SYS_DESCR_OID),
+        return_exceptions=True,
+    )
+    sys_name_rows  = sys_name_rows  if not isinstance(sys_name_rows, Exception)  else []
+    sys_descr_rows = sys_descr_rows if not isinstance(sys_descr_rows, Exception) else []
+
+    if not sys_name_rows and not sys_descr_rows:
+        return None   # SNMP not reachable
+
+    sys_name  = sys_name_rows[0][1]  if sys_name_rows  else ip
+    sys_descr = sys_descr_rows[0][1] if sys_descr_rows else ""
+
+    lldp_neighbors, lldp_mgmt_ips, lldp_loc_ports, if_map, arp_map = await asyncio.gather(
+        _snmp_get_lldp_neighbors(ip, community),
+        _snmp_get_lldp_mgmt_ips(ip, community),
+        _snmp_get_lldp_local_port_names(ip, community),
+        _snmp_get_ifnames(ip, community),
+        _snmp_get_arp(ip, community),
+        return_exceptions=True,
+    )
+    lldp_neighbors = lldp_neighbors if not isinstance(lldp_neighbors, Exception) else []
+    lldp_mgmt_ips  = lldp_mgmt_ips  if not isinstance(lldp_mgmt_ips,  Exception) else {}
+    lldp_loc_ports = lldp_loc_ports if not isinstance(lldp_loc_ports, Exception) else {}
+    if_map         = if_map         if not isinstance(if_map,         Exception) else {}
+    arp_map        = arp_map        if not isinstance(arp_map,        Exception) else {}
+
+    for n in lldp_neighbors:
+        port_num = n["local_port_num"]
+        n["local_port_name"] = (
+            lldp_loc_ports.get(port_num)
+            or if_map.get(port_num)
+            or f"port{port_num}"
+        )
+        # Resolve remote IP: lldpRemManAddr > ARP via chassis MAC
+        mgmt_ip = lldp_mgmt_ips.get(n["lldp_key"], "")
+        if not mgmt_ip:
+            chassis_mac = _parse_snmp_mac(n["chassis_id"])
+            if chassis_mac:
+                mgmt_ip = arp_map.get(chassis_mac, "")
+        n["remote_ip"]       = mgmt_ip
+        n["chassis_mac"]     = _parse_snmp_mac(n["chassis_id"]) or ""
+
+    fdb = await _snmp_get_fdb(ip, community, if_map)
+
+    # Build port_devices: port_name -> [{mac, ip}]
+    port_devices: dict[str, list[dict]] = {}
+    for port_name, macs in fdb.items():
+        port_devices[port_name] = [
+            {"mac": mac, "ip": arp_map.get(mac, "")} for mac in macs
+        ]
+
+    return {
+        "ip":             ip,
+        "sys_name":       sys_name,
+        "sys_descr":      sys_descr,
+        "lldp_neighbors": lldp_neighbors,
+        "port_devices":   port_devices,
+        "if_map":         if_map,
+    }
+
+
+async def _discover_network(seed_ips: list[str], community: str) -> dict[str, dict]:
+    """
+    Recursively discover all SNMP-reachable switches starting from seed_ips
+    by following LLDP neighbor links. Returns {ip: switch_data_dict}.
+    """
+    discovered: dict[str, dict] = {}
+    queue = list(dict.fromkeys(seed_ips))   # deduplicated, ordered
+    in_queue: set[str] = set(queue)
+
+    while queue:
+        ip = queue.pop(0)
+        if ip in discovered:
+            continue
+        sw_data = await _discover_one_switch(ip, community)
+        if not sw_data:
+            continue
+        discovered[ip] = sw_data
+
+        for n in sw_data.get("lldp_neighbors", []):
+            n_ip = n.get("remote_ip", "")
+            if not n_ip or n_ip in discovered or n_ip in in_queue:
+                continue
+            try:
+                addr = ipaddress.IPv4Address(n_ip)
+                if not addr.is_multicast and not addr.is_loopback:
+                    queue.append(n_ip)
+                    in_queue.add(n_ip)
+            except ValueError:
+                pass
+
+    return discovered
+
+
+def _build_snmp_topology(discovered: dict[str, dict], seed_ips: list[str]) -> dict:
+    """
+    Build nodes + edges from SNMP-discovered data.
+    BFS from seed_ips to determine parent-child switch relationships.
+    FDB data provides device-level connections.
+    """
+    all_ips = set(discovered.keys())
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_devices: set[str] = set()
+
+    # BFS from seeds to determine tree structure
+    parent_map: dict[str, str | None] = {}
+    port_to_child: dict[str, dict[str, tuple[str, str]]] = {}  # ip -> {child_ip: (local_port, remote_port)}
+    bfs_visited: set[str] = set()
+    bfs_queue = [ip for ip in seed_ips if ip in all_ips]
+    for ip in bfs_queue:
+        parent_map[ip] = None
+        bfs_visited.add(ip)
+
+    while bfs_queue:
+        ip = bfs_queue.pop(0)
+        sw = discovered[ip]
+        port_to_child.setdefault(ip, {})
+        for n in sw.get("lldp_neighbors", []):
+            r_ip = n.get("remote_ip", "")
+            if not r_ip or r_ip not in all_ips or r_ip in bfs_visited:
+                continue
+            bfs_visited.add(r_ip)
+            parent_map[r_ip] = ip
+            local_port = n["local_port_name"]
+            # Find remote's port name for this link
+            remote_port = next(
+                (rn["local_port_name"] for rn in discovered.get(r_ip, {}).get("lldp_neighbors", [])
+                 if rn.get("remote_ip") == ip),
+                "",
+            )
+            port_to_child[ip][r_ip] = (local_port, remote_port)
+            bfs_queue.append(r_ip)
+
+    # Any switch not reached from BFS seeds becomes an additional root
+    for ip in all_ips:
+        if ip not in parent_map:
+            parent_map[ip] = None
+
+    root_ips = {ip for ip, parent in parent_map.items() if parent is None}
+
+    # Virtual upstream node
+    nodes.append({
+        "id": "__upstream__",
+        "name": "Upstream / Internet",
+        "ip": "",
+        "managed": False,
+        "core": False,
+    })
+
+    # Switch nodes + switch-to-upstream edges for roots
+    for ip, sw in discovered.items():
+        nodes.append({
+            "id":      f"sw_{ip}",
+            "name":    sw["sys_name"] or ip,
+            "ip":      ip,
+            "managed": True,
+            "descr":   sw.get("sys_descr", ""),
+        })
+        if ip in root_ips:
+            edges.append({
+                "source": "__upstream__",
+                "target": f"sw_{ip}",
+                "source_port": "",
+                "target_port": "",
+            })
+
+    # Switch-to-switch edges from BFS tree
+    inter_sw_ports: dict[str, set[str]] = {ip: set() for ip in all_ips}
+    for parent_ip, children in port_to_child.items():
+        for child_ip, (local_port, remote_port) in children.items():
+            inter_sw_ports.setdefault(parent_ip, set()).add(local_port)
+            inter_sw_ports.setdefault(child_ip, set()).add(remote_port)
+            edges.append({
+                "source":      f"sw_{parent_ip}",
+                "target":      f"sw_{child_ip}",
+                "source_port": local_port,
+                "target_port": remote_port,
+            })
+
+    # Device nodes from FDB (skip ports carrying inter-switch links)
+    for ip, sw in discovered.items():
+        sw_id = f"sw_{ip}"
+        skip_ports = inter_sw_ports.get(ip, set())
+        neighbor_chassis_macs = {
+            n["chassis_mac"] for n in sw.get("lldp_neighbors", []) if n.get("chassis_mac")
+        }
+
+        for port_name, devs in sw.get("port_devices", {}).items():
+            if port_name in skip_ports:
+                continue
+            for dev in devs:
+                mac = dev["mac"]
+                if mac in neighbor_chassis_macs:
+                    continue
+                dev_ip  = dev.get("ip", "")
+                dev_id  = f"dev_{mac.replace(':', '')}"
+                if dev_id in seen_devices:
+                    continue
+                seen_devices.add(dev_id)
+                nodes.append({
+                    "id":      dev_id,
+                    "name":    dev_ip or mac,
+                    "ip":      dev_ip,
+                    "managed": False,
+                    "device":  True,
+                })
+                edges.append({
+                    "source":      sw_id,
+                    "target":      dev_id,
+                    "source_port": port_name,
+                    "target_port": "",
+                })
+
+    return {"nodes": nodes, "edges": edges}
+
+
+# ---------------------------------------------------------------------------
+# SNMP discovery settings API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/settings/core-switch")
+async def get_core_switch_config():
+    return load_snmp_config()
+
+
+@app.put("/api/settings/core-switch")
+async def update_core_switch_config(config: SnmpDiscoveryConfig):
+    data = config.model_dump()
+    # Also keep legacy 'ip' field pointing to first seed for backwards compat
+    data["ip"] = config.seed_ips[0] if config.seed_ips else ""
+    save_snmp_config(data)
+    return {"ok": True}
+
+
+@app.post("/api/settings/core-switch/test")
+async def test_core_switch_snmp():
+    cfg = load_snmp_config()
+    seed_ips = cfg.get("seed_ips") or ([cfg["ip"]] if cfg.get("ip") else [])
+    if not seed_ips:
+        raise HTTPException(400, "No seed IPs configured")
+    ip = seed_ips[0]
+    community = cfg.get("community", "public")
+    sys_name_res  = await _snmp_walk(ip, community, _SYS_NAME_OID)
+    sys_descr_res = await _snmp_walk(ip, community, _SYS_DESCR_OID)
+    if not sys_name_res and not sys_descr_res:
+        raise HTTPException(502, f"No SNMP response from {ip}")
+    return {
+        "ok":       True,
+        "sys_name":  sys_name_res[0][1]  if sys_name_res  else "",
+        "sys_descr": sys_descr_res[0][1] if sys_descr_res else "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Topology endpoint - SNMP + Axis HTTP hybrid auto-discovery
+# ---------------------------------------------------------------------------
+
+# Simple TTL cache: avoids running expensive SNMP + HTTP queries on every request.
+_topology_cache: dict = {}
+_TOPOLOGY_CACHE_TTL = 90   # seconds
+
+
+@app.post("/api/topology/refresh")
+async def refresh_topology():
+    """Invalidate the topology cache so the next GET rebuilds it."""
+    _topology_cache.clear()
+    return {"ok": True}
+
+
 @app.get("/api/topology")
 async def get_topology():
-    """Build network topology graph using LLDP data collected via SNMP."""
-    switches = load_switches()
+    """
+    Hybrid topology discovery:
+    1. SNMP LLDP from configured seed IPs -> finds all SNMP/LLDP-capable switches
+       and builds port-level connectivity via FDB + ARP.
+    2. Axis HTTP API (config/topology) for switches in the inventory ->
+       identifies Axis switches that don't support LLDP and enumerates their
+       connected devices with proper names and port numbers.
+    3. Falls back to pure Axis HTTP topology when SNMP is not configured.
+
+    This works for any network: standard LLDP networks discover all switches
+    automatically; Axis-specific networks use the HTTP API for Axis switches
+    while SNMP provides the core switch port mapping.
+    """
+    import time as _time
+    cached = _topology_cache.get("data")
+    if cached and (_time.monotonic() - _topology_cache.get("ts", 0)) < _TOPOLOGY_CACHE_TTL:
+        return cached
+
+    snmp_cfg = load_snmp_config()
+    seed_ips: list[str] = snmp_cfg.get("seed_ips") or (
+        [snmp_cfg["ip"]] if snmp_cfg.get("ip") else []
+    )
+    axis_switches = load_switches()
+
+    if snmp_cfg.get("enabled") and seed_ips:
+        community = snmp_cfg.get("community", "public")
+
+        # Run SNMP discovery first (sequential), then Axis HTTP queries in parallel.
+        # Separating these avoids UDP packet loss in the SNMP FDB walk caused
+        # by concurrent HTTP connections to 20+ Axis switches.
+        try:
+            discovered: dict[str, dict] = await _discover_network(seed_ips, community)
+        except Exception:
+            discovered = {}
+
+        axis_raw_list = await asyncio.gather(
+            *[_fetch_topology_raw(sw) for sw in axis_switches],
+            return_exceptions=True,
+        )
+
+        if discovered:
+            # Build SNMP base topology (LLDP-discovered switches + their FDB devices)
+            base = _build_snmp_topology(discovered, seed_ips)
+            nodes: list[dict] = base["nodes"]
+            edges: list[dict] = base["edges"]
+
+            # Axis HTTP data: ip -> {sw, raw_topology}
+            axis_ip_to_info: dict[str, dict] = {}
+            for sw, raw in zip(axis_switches, axis_raw_list):
+                if not isinstance(raw, Exception) and raw is not None:
+                    axis_ip_to_info[sw["ip"]] = {"sw": sw, "raw": raw}
+
+            if axis_ip_to_info:
+                # Build IP -> core-switch port map from seed switch FDB
+                seed_ip = seed_ips[0]
+                seed_data = discovered.get(seed_ip, {})
+                ip_to_seed_port: dict[str, str] = {}
+                for port_name, devs in seed_data.get("port_devices", {}).items():
+                    for dev in devs:
+                        if dev.get("ip"):
+                            ip_to_seed_port[dev["ip"]] = port_name
+
+                all_axis_ips = {sw["ip"] for sw in axis_switches}
+
+                # Remove FDB device nodes that are actually Axis switches
+                removed_dev_ids = {
+                    n["id"] for n in nodes
+                    if n.get("device") and n.get("ip") in all_axis_ips
+                }
+                nodes = [n for n in nodes if n["id"] not in removed_dev_ids]
+                edges = [e for e in edges if e["target"] not in removed_dev_ids]
+
+                existing_sw_ids = {n["id"] for n in nodes if n.get("managed")}
+                seed_sw_id    = f"sw_{seed_ip}"
+                parent_sw_id  = seed_sw_id if seed_sw_id in existing_sw_ids else "__upstream__"
+
+                # Build HP port -> set of Axis IPs on that port (from SNMP FDB).
+                # Ports with 2+ Axis switches indicate a daisy-chain pair.
+                hp_port_axis_set: dict[str, set[str]] = {}
+                for a_ip in all_axis_ips:
+                    hp_port = ip_to_seed_port.get(a_ip)
+                    if hp_port:
+                        hp_port_axis_set.setdefault(hp_port, set()).add(a_ip)
+                shared_hp_ports: dict[str, set[str]] = {
+                    p: ips for p, ips in hp_port_axis_set.items() if len(ips) > 1
+                }
+
+                # Build Axis-to-Axis daisy-chain map from HTTP topology.
+                # Collect ALL potential parent/child pairs where switch A reports
+                # switch B as a direct neighbor (gw_mac == A's own_mac).
+                # Then validate: only accept pairs where BOTH switches appear on
+                # the same HP FDB port (shared_hp_ports). This prevents false
+                # positives caused by management-gateway MAC reuse across VLANs.
+                axis_child_candidates: dict[str, list[tuple[str, str]]] = {}
+                for axis_ip, info in axis_ip_to_info.items():
+                    own_mac = info["raw"].get("own_mac", "").lower()
+                    if not own_mac:
+                        continue
+                    for nb in info["raw"].get("neighbors", []):
+                        nb_ip = nb.get("ip", "")
+                        if nb_ip not in all_axis_ips:
+                            continue
+                        gw_mac = nb.get("gw_mac", "").lower()
+                        if gw_mac == own_mac:
+                            axis_child_candidates.setdefault(nb_ip, []).append(
+                                (axis_ip, nb.get("port", ""))
+                            )
+
+                # Validate candidates against shared HP FDB port groups.
+                axis_child_map: dict[str, tuple[str, str]] = {}
+                for child_ip, candidates in axis_child_candidates.items():
+                    for parent_ip, parent_port in candidates:
+                        for port_ips in shared_hp_ports.values():
+                            if child_ip in port_ips and parent_ip in port_ips:
+                                axis_child_map[child_ip] = (parent_ip, parent_port)
+                                break
+                        if child_ip in axis_child_map:
+                            break
+
+                # Break cycles: A is child of B AND B is child of A (both
+                # switches report each other as direct neighbors).
+                # Keep the direction with the HIGHER source port number
+                # (expansion / inter-switch ports are numbered higher on T8508).
+                # Tiebreaker: keep the mapping where the child has the higher IP.
+                seen_pairs: set[frozenset] = set()
+                to_delete: set[str] = set()
+                for child_ip, (parent_ip, parent_port) in list(axis_child_map.items()):
+                    if parent_ip not in axis_child_map:
+                        continue
+                    if axis_child_map[parent_ip][0] != child_ip:
+                        continue
+                    pair = frozenset([child_ip, parent_ip])
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    other_port = axis_child_map[parent_ip][1]
+                    try:
+                        my_n = int(parent_port)
+                    except (ValueError, TypeError):
+                        my_n = 0
+                    try:
+                        other_n = int(other_port)
+                    except (ValueError, TypeError):
+                        other_n = 0
+                    if my_n > other_n:
+                        to_delete.add(parent_ip)   # keep child_ip->parent_ip
+                    elif my_n < other_n:
+                        to_delete.add(child_ip)    # keep parent_ip->child_ip
+                    else:
+                        # Tie: keep higher IP as the child
+                        if child_ip > parent_ip:
+                            to_delete.add(parent_ip)
+                        else:
+                            to_delete.add(child_ip)
+                for ip in to_delete:
+                    del axis_child_map[ip]
+
+                # Build device name and direct-placement lookups from Axis HTTP.
+                device_name: dict[str, str] = {}
+                # axis_direct_devices: device_ip -> (axis_ip, port_on_axis)
+                axis_direct_devices: dict[str, tuple[str, str]] = {}
+
+                for axis_ip, info in axis_ip_to_info.items():
+                    own_mac = info["raw"].get("own_mac", "").lower()
+                    for nb in info["raw"].get("neighbors", []):
+                        nb_ip = nb.get("ip", "")
+                        if not nb_ip or nb_ip in all_axis_ips:
+                            continue
+                        nm_val = nb.get("name") or nb.get("model") or ""
+                        if nm_val and nb_ip not in device_name:
+                            device_name[nb_ip] = nm_val
+                        gw_mac = nb.get("gw_mac", "").lower()
+                        if gw_mac == own_mac and nb_ip not in axis_direct_devices:
+                            axis_direct_devices[nb_ip] = (axis_ip, nb.get("port", ""))
+
+                # Add ALL Axis switches as managed nodes (even those with no HTTP data).
+                # Daisy-chained switches get an edge from their parent Axis switch;
+                # top-level switches get an edge from the HP seed switch.
+                for sw in axis_switches:
+                    axis_ip   = sw["ip"]
+                    sw_node_id = f"sw_{axis_ip}"
+                    if sw_node_id not in existing_sw_ids:
+                        info = axis_ip_to_info.get(axis_ip)
+                        nodes.append({
+                            "id":      sw_node_id,
+                            "name":    info["sw"]["name"] if info else sw["name"],
+                            "ip":      axis_ip,
+                            "managed": True,
+                        })
+                        existing_sw_ids.add(sw_node_id)
+
+                    # Build the edge for this switch (deferred so all nodes exist first)
+
+                # Now build inter-switch edges (after all nodes are added)
+                for sw in axis_switches:
+                    axis_ip    = sw["ip"]
+                    sw_node_id = f"sw_{axis_ip}"
+                    # Skip if an edge to this switch already exists
+                    if any(e["target"] == sw_node_id for e in edges):
+                        continue
+                    if axis_ip in axis_child_map:
+                        # Daisy-chained: parent is another Axis switch
+                        parent_axis_ip, parent_port = axis_child_map[axis_ip]
+                        edges.append({
+                            "source":      f"sw_{parent_axis_ip}",
+                            "target":      sw_node_id,
+                            "source_port": parent_port,
+                            "target_port": "",
+                        })
+                    else:
+                        # Top-level: connect to HP seed switch
+                        edges.append({
+                            "source":      parent_sw_id,
+                            "target":      sw_node_id,
+                            "source_port": ip_to_seed_port.get(axis_ip, ""),
+                            "target_port": "",
+                        })
+
+                # Reassign FDB device edges.
+                # Priority 1 (Axis HTTP direct): if the device is known to be
+                # directly connected to a specific Axis switch, use that.
+                # Priority 2 (HP FDB port fallback): for devices whose IP is in
+                # SNMP ARP but not in Axis HTTP topology, fall back to routing
+                # via the HP port -> Axis switch map.
+                # Build HP port -> all Axis switch IPs set for the fallback.
+                # Build HP port -> top-level Axis switch (directly connected to HP)
+                # and HP port -> full cluster (top-level + daisy-chain children).
+                # HP FDB is authoritative for WHICH switch cluster a device is in.
+                # axis_direct_devices enriches the port and picks the exact child
+                # switch only when it agrees with the HP FDB cluster.
+                axis_to_hp_port: dict[str, str] = {}
+                for a_ip in all_axis_ips:
+                    if a_ip in ip_to_seed_port:
+                        axis_to_hp_port[a_ip] = ip_to_seed_port[a_ip]
+                # Daisy-chain children share their parent's HP port
+                for child_ip, (parent_ip, _) in axis_child_map.items():
+                    if parent_ip in axis_to_hp_port and child_ip not in axis_to_hp_port:
+                        axis_to_hp_port[child_ip] = axis_to_hp_port[parent_ip]
+                hp_port_cluster: dict[str, set[str]] = {}
+                for a_ip, port in axis_to_hp_port.items():
+                    hp_port_cluster.setdefault(port, set()).add(a_ip)
+                hp_port_top: dict[str, str] = {}
+                for e in edges:
+                    if e["source"] != seed_sw_id:
+                        continue
+                    tgt = next((n for n in nodes if n["id"] == e["target"]), None)
+                    if tgt and tgt.get("managed") and tgt.get("ip") != seed_ip:
+                        hp_port_top[e["source_port"]] = tgt["ip"]
+
+                node_by_id = {n["id"]: n for n in nodes}
+                for e in edges:
+                    if e["source"] != seed_sw_id:
+                        continue
+                    tgt = node_by_id.get(e["target"])
+                    if not tgt or not tgt.get("device"):
+                        continue
+                    dev_ip  = tgt.get("ip", "")
+                    hp_port = e.get("source_port", "")
+                    # Enrich name from Axis data
+                    if dev_ip in device_name and (not tgt["name"] or tgt["name"] == dev_ip):
+                        tgt["name"] = device_name[dev_ip]
+                    if not hp_port:
+                        continue
+                    top_axis = hp_port_top.get(hp_port)
+                    if not top_axis:
+                        continue
+                    cluster = hp_port_cluster.get(hp_port, {top_axis})
+                    # Use axis_direct_devices only when it agrees with the HP cluster.
+                    # This prevents false positives from management-gateway MACs.
+                    direct = axis_direct_devices.get(dev_ip)
+                    if direct and direct[0] in cluster:
+                        e["source"]      = f"sw_{direct[0]}"
+                        e["source_port"] = direct[1]
+                    else:
+                        e["source"]      = f"sw_{top_axis}"
+                        e["source_port"] = ""
+
+                # Remove IP-less FDB device nodes (created when SNMP ARP failed).
+                # They have no useful information and can't be routed anywhere.
+                no_ip_dev_ids = {
+                    n["id"] for n in nodes
+                    if n.get("device") and not n.get("ip")
+                }
+                if no_ip_dev_ids:
+                    nodes = [n for n in nodes if n["id"] not in no_ip_dev_ids]
+                    edges = [e for e in edges if e["target"] not in no_ip_dev_ids]
+
+                # Add device nodes from Axis HTTP direct neighbors for any device
+                # not already present. This fills the gap when SNMP ARP fails.
+                existing_dev_ips = {n["ip"] for n in nodes if n.get("device") and n.get("ip")}
+                for axis_ip, info in axis_ip_to_info.items():
+                    own_mac    = info["raw"].get("own_mac", "").lower()
+                    sw_node_id = f"sw_{axis_ip}"
+                    for nb in info["raw"].get("neighbors", []):
+                        nb_ip = nb.get("ip", "")
+                        if not nb_ip or nb_ip in all_axis_ips or nb_ip in existing_dev_ips:
+                            continue
+                        gw_mac = nb.get("gw_mac", "").lower()
+                        if gw_mac != own_mac:
+                            continue  # only directly-connected devices
+                        nb_mac  = (nb.get("mac") or "").replace("-", "").replace(":", "").lower()
+                        dev_id  = f"dev_{nb_mac}" if nb_mac else f"dev_ip_{nb_ip.replace('.', '_')}"
+                        nm_val  = nb.get("name") or nb.get("model") or nb_ip
+                        nodes.append({
+                            "id":      dev_id,
+                            "name":    nm_val,
+                            "ip":      nb_ip,
+                            "managed": False,
+                            "device":  True,
+                        })
+                        edges.append({
+                            "source":      sw_node_id,
+                            "target":      dev_id,
+                            "source_port": nb.get("port", ""),
+                            "target_port": "",
+                        })
+                        existing_dev_ips.add(nb_ip)
+
+            sw_count  = sum(1 for n in nodes if n.get("managed"))
+            dev_count = sum(1 for n in nodes if n.get("device"))
+            result = {
+                "nodes": nodes,
+                "edges": edges,
+                "snmp_status": {
+                    "ok":             True,
+                    "switches_found": sw_count,
+                    "discovery":      "snmp+axis_http" if axis_ip_to_info else "snmp_lldp",
+                },
+            }
+            _topology_cache["data"] = result
+            _topology_cache["ts"]   = _time.monotonic()
+            return result
+
+    # -----------------------------------------------------------------------
+    # Fallback: pure Axis HTTP API topology (SNMP not configured)
+    # -----------------------------------------------------------------------
+    switches = axis_switches
     nodes = [
         {"id": sw["id"], "name": sw["name"], "ip": sw["ip"], "managed": True}
         for sw in switches
     ]
-    name_lower_to_id = {sw["name"].lower(): sw["id"] for sw in switches}
+    ip_to_sw = {sw["ip"]: sw for sw in switches}
 
-    # Query all switches in parallel
-    all_neighbors = await asyncio.gather(
-        *[_get_lldp_neighbors(sw) for sw in switches],
+    raw_results = await asyncio.gather(
+        *[_fetch_topology_raw(sw) for sw in switches],
         return_exceptions=True,
     )
 
-    extra_nodes: dict[str, dict] = {}
-    edges: list[dict] = []
-    edge_idx: dict[tuple, int] = {}
-    seen_edge_keys: set[tuple] = set()
-    snmp_status: dict[str, str] = {}
+    sw_own_mac:   dict[str, str]         = {}
+    sw_neighbors: dict[str, list[dict]]  = {}
+    http_status:  dict[str, str]         = {}
 
-    for sw, neighbors in zip(switches, all_neighbors):
-        if isinstance(neighbors, Exception):
-            snmp_status[sw["id"]] = f"error: {neighbors}"
+    for sw, result in zip(switches, raw_results):
+        if isinstance(result, Exception):
+            http_status[sw["id"]] = f"error: {result}"
             continue
-        if not neighbors:
-            snmp_status[sw["id"]] = "no_lldp"
+        if result is None:
+            http_status[sw["id"]] = "no_data"
             continue
-        snmp_status[sw["id"]] = "ok"
+        http_status[sw["id"]] = "ok"
+        own_mac = result["own_mac"]
+        sw_own_mac[sw["id"]] = own_mac
+        sw_neighbors[sw["id"]] = result["neighbors"]
+
+    direct: dict[str, dict[str, str]] = {}
+    for sw in switches:
+        sw_id  = sw["id"]
+        my_mac = sw_own_mac.get(sw_id, "")
+        direct[sw_id] = {}
+        neighbors = sw_neighbors.get(sw_id, [])
+
+        port_counts: dict[str, int] = {}
         for nb in neighbors:
-            remote_name = nb["remote_sys_name"]
-            remote_id = name_lower_to_id.get(remote_name.lower())
-            if not remote_id:
-                if remote_name not in extra_nodes:
-                    extra_nodes[remote_name] = {
-                        "id": f"ext:{remote_name}",
-                        "name": remote_name,
-                        "ip": "",
-                        "managed": False,
-                    }
-                remote_id = f"ext:{remote_name}"
+            if nb["ip"] in ip_to_sw:
+                port_counts[nb["port"]] = port_counts.get(nb["port"], 0) + 1
+        max_count  = max(port_counts.values(), default=0)
+        uplink_ports = {p for p, c in port_counts.items() if c == max_count} if max_count > 1 else set()
 
-            edge_key = tuple(sorted([sw["id"], remote_id]))
-            if edge_key not in seen_edge_keys:
-                seen_edge_keys.add(edge_key)
-                edge_idx[edge_key] = len(edges)
-                edges.append({
-                    "source": sw["id"],
-                    "target": remote_id,
-                    "source_port": nb["local_port"],
-                    "target_port": nb["remote_port_desc"] or nb["remote_port_id"],
-                })
-            else:
-                # Update with the actual local port number from the reverse direction
-                idx = edge_idx[edge_key]
-                e = edges[idx]
-                if e["source"] == remote_id:
-                    # This switch (sw) is the target in the stored edge
-                    e["target_port"] = str(nb["local_port"])
+        for nb in neighbors:
+            nb_ip  = nb["ip"]
+            gw_mac = nb["gw_mac"]
+            nb_sw  = ip_to_sw.get(nb_ip)
+            if not nb_sw or nb_sw["id"] == sw_id:
+                continue
+            if nb["port"] in uplink_ports:
+                continue
+            if gw_mac and my_mac and gw_mac == my_mac:
+                nb_id = nb_sw["id"]
+                if nb_id not in direct[sw_id]:
+                    direct[sw_id][nb_id] = nb["port"]
 
-    return {
-        "nodes": nodes + list(extra_nodes.values()),
-        "edges": edges,
-        "snmp_status": snmp_status,
-    }
+    edges: list[dict] = []
+    seen_edge_keys: set[tuple] = set()
+    for sw_id, nbrs in direct.items():
+        for nb_id, local_port in nbrs.items():
+            edge_key = tuple(sorted([sw_id, nb_id]))
+            if edge_key in seen_edge_keys:
+                continue
+            seen_edge_keys.add(edge_key)
+            edges.append({
+                "source":      sw_id,
+                "target":      nb_id,
+                "source_port": local_port,
+                "target_port": direct.get(nb_id, {}).get(sw_id, ""),
+            })
+
+    adjacency: dict[str, set[str]] = {sw["id"]: set() for sw in switches}
+    for sw_id, nbrs in direct.items():
+        for nb_id in nbrs:
+            adjacency[sw_id].add(nb_id)
+            adjacency[nb_id].add(sw_id)
+
+    visited: set[str] = set()
+    components: list[set[str]] = []
+    for sw in switches:
+        sid = sw["id"]
+        if sid in visited:
+            continue
+        component: set[str] = set()
+        bq = [sid]
+        while bq:
+            node = bq.pop(0)
+            if node in visited:
+                continue
+            visited.add(node)
+            component.add(node)
+            for nb in adjacency[node]:
+                if nb not in visited:
+                    bq.append(nb)
+        components.append(component)
+
+    UPSTREAM_ID = "__upstream__"
+    nodes.append({"id": UPSTREAM_ID, "name": "Upstream Network", "ip": "", "managed": False})
+    for component in components:
+        root    = max(component, key=lambda sid: len(adjacency.get(sid, set())))
+        root_sw = next((sw for sw in switches if sw["id"] == root), None)
+        edges.append({
+            "source": UPSTREAM_ID, "target": root, "source_port": "", "target_port": "",
+        })
+
+    seen_device_ips: set[str] = set()
+    for sw in switches:
+        sw_id  = sw["id"]
+        my_mac = sw_own_mac.get(sw_id, "")
+        if not my_mac:
+            continue
+        neighbors = sw_neighbors.get(sw_id, [])
+        port_counts_l: dict[str, int] = {}
+        for nb in neighbors:
+            if nb["ip"] in ip_to_sw:
+                port_counts_l[nb["port"]] = port_counts_l.get(nb["port"], 0) + 1
+        max_c = max(port_counts_l.values(), default=0)
+        uplink_l = {p for p, c in port_counts_l.items() if c == max_c} if max_c > 1 else set()
+
+        for nb in neighbors:
+            ip   = nb["ip"]
+            port = nb["port"]
+            if ip in ip_to_sw or port in uplink_l or nb["gw_mac"] != my_mac:
+                continue
+            if ip in seen_device_ips:
+                continue
+            seen_device_ips.add(ip)
+            dev_id = f"dev_{ip}"
+            nodes.append({"id": dev_id, "name": nb["name"] or nb["model"] or ip,
+                          "ip": ip, "managed": False, "device": True})
+            edges.append({"source": sw_id, "target": dev_id,
+                          "source_port": port, "target_port": ""})
+
+        for nb in neighbors:
+            ip   = nb["ip"]
+            port = nb["port"]
+            if ip in ip_to_sw or port not in uplink_l or nb["gw_mac"] != my_mac:
+                continue
+            if ip in seen_device_ips:
+                continue
+            seen_device_ips.add(ip)
+            dev_id = f"dev_{ip}"
+            nodes.append({"id": dev_id, "name": nb["name"] or nb["model"] or ip,
+                          "ip": ip, "managed": False, "device": True})
+            edges.append({"source": UPSTREAM_ID, "target": dev_id,
+                          "source_port": "", "target_port": ""})
+
+    result = {"nodes": nodes, "edges": edges, "snmp_status": http_status}
+    _topology_cache["data"] = result
+    _topology_cache["ts"]   = _time.monotonic()
+    return result
+
+
+async def _fetch_topology_raw(sw: dict) -> dict | None:
+    """
+    Fetch config/topology from a switch.
+    Returns {'own_mac': str, 'neighbors': [dict, ...]}
+    Each neighbor dict: {ip, port, gw_mac, name, model, mac}
+
+    The Axis topology response is one continuous stream where device records
+    are delimited by '|/' (pipe-slash). Embedded newlines are line-wrapping only.
+    Fields within each record are '|'-separated:
+      0=device_mac, 1=gw_mac, 2=vlan, 3=local_port, 4=status, 5=ip,
+      6=(empty), 7=name (URL-encoded), 8=model (URL-encoded)
+    The self-entry (first record) is prefixed with '^'.
+    """
+    from urllib.parse import unquote
+    try:
+        async with _switch_session(sw) as client:
+            resp = await client.get("/config/topology")
+            if resp.status_code != 200:
+                return None
+            text = resp.text
+    except Exception:
+        return None
+
+    # Strip line-wrapping newlines; records are separated by |/
+    text = text.replace("\r", "").replace("\n", "")
+    if text.startswith("^"):
+        text = text[1:]
+
+    own_mac: str = ""
+    neighbors: list[dict] = []
+
+    for i, record in enumerate(text.split("|/")):
+        parts = record.split("|")
+        if len(parts) < 6:
+            continue
+
+        device_mac = parts[0]
+        gw_mac     = parts[1] if len(parts) > 1 else ""
+        local_port = parts[3] if len(parts) > 3 else ""
+        ip         = parts[5] if len(parts) > 5 else ""
+        name       = unquote(parts[7]) if len(parts) > 7 else ""
+        model      = unquote(parts[8]) if len(parts) > 8 else ""
+
+        if i == 0:
+            own_mac = device_mac
+            continue
+
+        if not device_mac:
+            continue
+
+        neighbors.append({
+            "mac":    device_mac,
+            "gw_mac": gw_mac,
+            "port":   local_port,
+            "ip":     ip,
+            "name":   name,
+            "model":  model,
+        })
+
+    return {"own_mac": own_mac, "neighbors": neighbors}
+
+
 
 
 # ---------------------------------------------------------------------------

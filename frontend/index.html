@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Axis Switch Manager</title>
-  <link rel="stylesheet" href="style.css?v=af4e4a7" />
+  <link rel="stylesheet" href="style.css?v=topo2" />
 </head>
 <body>
   <div id="app">
@@ -128,6 +128,25 @@
               </div>
             </div>
           </div>
+
+          <div class="config-card" style="margin-top:16px">
+            <div class="config-card-header"><h3>Core Switch (SNMP)</h3></div>
+            <div class="config-card-body">
+              <div class="form-group">
+                <label>Seed switch IPs <span style="color:var(--text-muted);font-size:11px">(comma-separated)</span></label>
+                <input type="text" id="snmp-seed-ips" placeholder="10.0.0.1, 10.0.0.2" style="width:280px" />
+              </div>
+              <div class="form-group">
+                <label>SNMP community (read-only)</label>
+                <input type="text" id="snmp-community" placeholder="public" style="width:180px" />
+              </div>
+              <div id="snmp-test-result" style="font-size:12px;margin-bottom:10px;color:var(--text-muted)"></div>
+              <div style="display:flex;gap:8px">
+                <button class="btn btn-primary" onclick="saveSnmpSettings()">Save</button>
+                <button class="btn btn-ghost" onclick="testSnmpSettings()">Test connection</button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -135,16 +154,21 @@
       <div id="view-topology" class="view">
         <div class="page-header">
           <h1>Network Topology</h1>
-          <button class="btn btn-ghost" onclick="loadTopologyView()">&#8635; Refresh</button>
+          <div class="header-actions">
+            <button class="btn btn-ghost" id="topo-btn-view" onclick="topoToggleView()">&#9737; Canvas</button>
+            <button class="btn btn-ghost" onclick="topoFitAll()">&#8690; Fit All</button>
+            <button class="btn btn-ghost" onclick="topoRefresh()">&#8635; Refresh</button>
+          </div>
         </div>
         <div id="topology-status" class="hint-text" style="margin-bottom:8px"></div>
-        <div id="topology-container">
-          <canvas id="topology-canvas"></canvas>
+        <div id="topology-canvas-wrap">
+          <div id="topology-canvas"></div>
         </div>
         <div class="topology-legend">
           <span class="legend-item"><span class="legend-dot managed"></span> Managed Switch</span>
-          <span class="legend-item"><span class="legend-dot unmanaged"></span> Discovered Device</span>
-          <span class="legend-item" style="color:var(--text-muted);font-size:12px">Tree layout shows LLDP connections with port labels</span>
+          <span class="legend-item"><span class="legend-dot upstream"></span> Upstream Network</span>
+          <span class="legend-item"><span class="legend-dot device"></span> Connected Device</span>
+          <span class="legend-item" style="color:var(--text-muted);font-size:12px">Click a switch to open details &middot; use &#9737; Canvas for interactive graph view</span>
         </div>
       </div>
     </main>
@@ -426,6 +450,7 @@
   <!-- Toast notifications -->
   <div id="toast-container"></div>
 
-  <script src="app.js?v=af4e4a7"></script>
+  <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+  <script src="app.js?v=topo5"></script>
 </body>
 </html>

@@ -770,136 +770,157 @@ select.priority-sel {
 
 .cfg-actions { margin-top: 16px; display: flex; gap: 8px; }
 
-/* ---- Network Topology ---- */
-#topology-container {
+/* ---- Network Topology (interactive canvas) ---- */
+#topology-canvas-wrap {
   width: 100%;
-  max-height: calc(100vh - 200px);
-  min-height: 420px;
+  height: calc(100vh - 220px);
+  min-height: 480px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 12px;
-  overflow-y: auto;
+  overflow: hidden;
   position: relative;
 }
 
-#topology-tree {
-  padding: 20px 24px;
-  min-height: 100%;
-  box-sizing: border-box;
+#topology-canvas {
+  width: 100%;
+  height: 100%;
+  overflow: auto; /* tree list needs scroll */
+}
+
+/* ---- Topology: HTML tree list view ---- */
+.topo-tree-list {
+  padding: 12px 16px;
   font-size: 13px;
-  font-family: system-ui, sans-serif;
+  color: var(--text);
+  min-width: max-content;
 }
 
-.topo-loading {
-  padding: 20px;
-  color: var(--text-muted);
-}
-
-.topo-no-links {
-  padding: 10px 14px;
-  margin-bottom: 16px;
+.topo-root-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
   font-size: 13px;
-  background: #fef9c3;
-  border: 1px solid #fde68a;
-  border-radius: 6px;
-  color: #713f12;
+  font-weight: 600;
+  color: #94a3b8;
+  margin-bottom: 2px;
 }
 
-.topo-component {
-  margin-bottom: 20px;
+.topo-root-name {
+  color: #94a3b8;
+  letter-spacing: 0.02em;
 }
-.topo-component + .topo-component {
-  border-top: 1px solid var(--border);
-  padding-top: 20px;
+
+.topo-ul {
+  list-style: none;
+  padding: 0 0 0 1.5rem;
+  margin: 0;
+}
+
+.topo-li {
+  position: relative;
+}
+
+/* Vertical tree line */
+.topo-li::after {
+  content: '';
+  position: absolute;
+  left: -1.5rem;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #334155;
+  pointer-events: none;
+}
+.topo-li:last-child::after {
+  bottom: auto;
+  height: 0.9rem; /* stop at midpoint of first row */
+}
+
+/* Horizontal connector */
+.topo-li::before {
+  content: '';
+  position: absolute;
+  left: -1.5rem;
+  top: 0.875rem;
+  width: 1.25rem;
+  height: 1px;
+  background: #334155;
+  z-index: 1;
+  pointer-events: none;
 }
 
 .topo-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 3px 0;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  cursor: default;
+  transition: background 0.1s;
 }
+.topo-row:hover { background: rgba(255,255,255,0.05); }
+.topo-row--dev  { opacity: 0.75; }
+.topo-row--dev:hover { opacity: 1; }
 
-.topo-node-box {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  background: #1e3a5f;
-  color: #fff;
-  border-radius: 6px;
-  padding: 5px 12px 5px 10px;
-  font-size: 13px;
-  white-space: nowrap;
-  user-select: none;
-}
-.topo-node-box:hover { filter: brightness(1.18); }
-.topo-node-box.root {
-  background: #0063a3;
-  font-weight: 600;
-  font-size: 14px;
-  padding: 7px 14px 7px 11px;
-}
-.topo-node-box.unmanaged { background: #334155; }
-
-.topo-sw-icon {
+/* Port badge */
+.topo-port {
   display: inline-block;
-  width: 16px;
-  height: 12px;
-  background:
-    linear-gradient(#fff 0 0) 0 1px/16px 2.5px,
-    linear-gradient(#fff 0 0) 0 5.5px/16px 2.5px,
-    linear-gradient(#fff 0 0) 0 10px/16px 2.5px;
-  background-repeat: no-repeat;
-  opacity: 0.85;
+  font-size: 10px;
+  font-weight: 600;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  color: #64748b;
+  background: #1a2536;
+  border: 1px solid #2d3f52;
+  border-radius: 3px;
+  padding: 1px 5px;
+  min-width: 2.4rem;
+  text-align: center;
   flex-shrink: 0;
 }
 
-.topo-sw-name { font-weight: 600; }
-.topo-sw-ip {
-  font-size: 11px;
-  font-family: monospace;
-  opacity: 0.6;
+/* Node icons */
+.topo-icon {
+  flex-shrink: 0;
+  border-radius: 2px;
 }
+.topo-icon.sw  { width: 11px; height: 11px; background: #0069B4; border-radius: 2px; }
+.topo-icon.dev { width: 9px;  height: 9px;  background: #15803d; border-radius: 50%; }
+.topo-icon.up  { width: 13px; height: 13px; background: #334155; border-radius: 3px; }
 
-/* Tree lines */
-.topo-children {
-  margin-left: 22px;
-  padding-left: 0;
-  border-left: 2px solid var(--border);
-}
-
-.topo-child {
-  position: relative;
-  padding-left: 22px;
-}
-.topo-child::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 16px;
-  width: 20px;
-  height: 2px;
-  background: var(--border);
-}
-
-.topo-port-link {
-  font-family: monospace;
-  font-size: 11px;
-  font-weight: 700;
-  color: #0063a3;
-  background: #eff6ff;
-  border: 1px solid #bfdbfe;
-  border-radius: 4px;
-  padding: 2px 7px;
-  white-space: nowrap;
+/* IP column */
+.topo-ip {
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  color: #64748b;
+  min-width: 9.5rem;
   flex-shrink: 0;
 }
 
-/* Isolated node grid (no edges) */
-.topo-isolated-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+/* Switch name - clickable */
+.topo-sw-name {
+  color: #93c5fd;
+  cursor: pointer;
+  font-weight: 500;
+}
+.topo-sw-name:hover { text-decoration: underline; color: #bfdbfe; }
+
+/* Device name */
+.topo-dev-name {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+/* Devices sub-section separator inside a switch */
+.topo-li--dev + .topo-li:not(.topo-li--dev) {
+  margin-top: 2px;
+}
+
+.topo-loading {
+  padding: 24px;
+  color: var(--text-muted);
+  font-size: 14px;
 }
 
 .topology-legend {
@@ -925,6 +946,8 @@ select.priority-sel {
   border: 2px solid #fff;
   box-shadow: 0 0 0 1px #cbd5e1;
 }
-.legend-dot.managed   { background: #0063a3; }
-.legend-dot.unmanaged { background: #94a3b8; }
+.legend-dot.managed   { background: #0069B4; }
+.legend-dot.unmanaged { background: #475569; }
+.legend-dot.upstream  { background: #1e293b; border: 2px solid #475569; border-radius: 50%; }
+.legend-dot.device    { background: #15803d; border-radius: 50%; }
 

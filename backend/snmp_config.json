@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "seed_ips": ["10.129.174.15"],
+  "community": "public",
+  "ip": "10.129.174.15"
+}

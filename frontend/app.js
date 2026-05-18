@@ -282,6 +282,23 @@ async function loadSwitchesList() {
 // Switch Detail
 // ---------------------------------------------------------------------------
 
+// Resolve topology node (may have sw_{ip} id) to managed switch, then open detail
+async function openTopoSwitch(nodeId, ip, name) {
+  // If nodeId looks like a sw_{ip} form, look up the real switch ID by IP
+  if (nodeId.startsWith('sw_') && ip) {
+    try {
+      const switches = await apiFetch('/switches');
+      const match = switches.find(s => s.ip === ip);
+      if (match) {
+        openSwitchDetail(match.id, match.name || name);
+        return;
+      }
+    } catch (_) {}
+  }
+  // Fallback: use nodeId as-is (works for legacy internal IDs)
+  openSwitchDetail(nodeId, name);
+}
+
 async function openSwitchDetail(id, name) {
   previousView = currentView;
   currentSwitchId = id;
@@ -1380,72 +1397,239 @@ async function applyBulkConfig() {
 // Network Topology
 // ---------------------------------------------------------------------------
 
+let _visNetwork    = null;
+let _topoViewMode  = "list";    // "list" (HTML tree, default) or "canvas" (vis-network)
+let _topoLayoutMode = "physics"; // canvas sub-mode: "physics" or "hierarchical"
+let _topoNodes     = null;
+let _topoEdges     = null;
+
+async function topoRefresh() {
+  try { await apiFetch("/topology/refresh", { method: "POST" }); } catch {}
+  await loadTopologyView();
+}
+
 async function loadTopologyView() {
   const statusEl = document.getElementById("topology-status");
-  const treeEl   = document.getElementById("topology-tree");
+  const canvasEl = document.getElementById("topology-canvas");
 
-  treeEl.innerHTML = '<div class="topo-loading">Loading topology via SNMP / LLDP\u2026</div>';
+  statusEl.textContent = "Loading topology\u2026";
+  if (_visNetwork) { _visNetwork.destroy(); _visNetwork = null; }
+  canvasEl.innerHTML = '<div class="topo-loading">Loading\u2026</div>';
 
   let data;
   try {
     data = await apiFetch("/topology");
   } catch {
     statusEl.textContent = "Failed to load topology data.";
-    treeEl.innerHTML = '';
+    canvasEl.innerHTML = '';
     return;
   }
 
   const { nodes, edges, snmp_status } = data;
-  const noLldp  = Object.values(snmp_status).filter(s => s === "no_lldp").length;
-  const errored = Object.values(snmp_status).filter(s => s.startsWith("error")).length;
-  const msgs = [];
-  if (noLldp)  msgs.push(`${noLldp} switch${noLldp > 1 ? "es" : ""} returned no LLDP data`);
-  if (errored) msgs.push(`${errored} switch${errored > 1 ? "es" : ""} unreachable via SNMP`);
-  if (!edges.length && !msgs.length) msgs.push("No links found: ensure SNMP is enabled and LLDP neighbors have formed");
-  statusEl.textContent = msgs.length
-    ? msgs.join("  \u00b7  ")
-    : `${nodes.length} device${nodes.length !== 1 ? "s" : ""}, ${edges.length} link${edges.length !== 1 ? "s" : ""}`;
+  _topoNodes = nodes;
+  _topoEdges = edges;
 
-  if (!nodes.length) { treeEl.innerHTML = '<div class="topo-loading">No switches configured.</div>'; return; }
+  const switchCnt = nodes.filter(n => n.managed).length;
+  const devCnt    = nodes.filter(n => n.device).length;
+  const linkCnt   = edges.filter(e => !e.target.startsWith("dev_") && e.source !== "__upstream__" && e.target !== "__upstream__").length;
+  const discovery = snmp_status?.discovery || "";
+  const statusMsg = discovery
+    ? `${switchCnt} switches, ${devCnt} devices, ${linkCnt} inter-switch link${linkCnt !== 1 ? "s" : ""}  \u00b7  ${discovery}`
+    : `${switchCnt} switches, ${devCnt} devices, ${linkCnt} inter-switch link${linkCnt !== 1 ? "s" : ""}`;
+  statusEl.textContent = statusMsg;
 
-  _renderTopologyTree(treeEl, nodes, edges);
-}
-
-function _renderTopologyTree(container, nodes, edges) {
-  const nodeById = Object.fromEntries(nodes.map(n => [n.id, n]));
-
-  if (!edges.length) {
-    container.innerHTML =
-      '<div class="topo-no-links">No LLDP connections found yet. Try refreshing in a minute after LLDP neighbors form.</div>' +
-      '<div class="topo-isolated-grid">' + nodes.map(n => _topoNodeHtml(n, true)).join('') + '</div>';
+  if (!nodes.length) {
+    canvasEl.innerHTML = '<div class="topo-loading">No switches configured.</div>';
     return;
   }
 
-  // Build adjacency list with port numbers on both sides
-  const adj = {};
-  nodes.forEach(n => { adj[n.id] = []; });
+  canvasEl.innerHTML = '';
+  if (_topoViewMode === "list") {
+    _renderTopologyTree(canvasEl, nodes, edges);
+  } else {
+    _renderTopologyCanvas(canvasEl, nodes, edges);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Topology: HTML tree list view
+// ---------------------------------------------------------------------------
+
+function _buildTopoAdjacency(nodes, edges) {
+  const nodeMap = {};
+  const adjMap  = {};  // id -> [{nodeId, parentPort}]
+
+  nodes.forEach(n => { nodeMap[n.id] = n; adjMap[n.id] = []; });
+
   edges.forEach(e => {
-    const sp = _topoPortNum(e.source_port);
-    const tp = _topoPortNum(e.target_port);
-    adj[e.source].push({ id: e.target, localPort: sp, remotePort: tp });
-    adj[e.target].push({ id: e.source, localPort: tp, remotePort: sp });
+    if (nodeMap[e.source] && nodeMap[e.target]) {
+      adjMap[e.source].push({ nodeId: e.target, parentPort: e.source_port || '' });
+    }
   });
 
-  // Build spanning forest starting from most-connected switch
-  const visited = new Set();
-  const components = [];
-  [...nodes]
-    .sort((a, b) => (adj[b.id]?.length || 0) - (adj[a.id]?.length || 0))
-    .forEach(n => {
-      if (!visited.has(n.id)) components.push(_topoSubtree(n.id, visited, adj, nodeById));
+  // Sort: managed switches before devices; within switches by port number
+  const portNum = p => { const m = String(p || '').match(/(\d+)$/); return m ? parseInt(m[1]) : 999; };
+  Object.keys(adjMap).forEach(id => {
+    adjMap[id].sort((a, b) => {
+      const an = nodeMap[a.nodeId], bn = nodeMap[b.nodeId];
+      if (!an || !bn) return 0;
+      if (an.managed !== bn.managed) return an.managed ? -1 : 1;
+      return portNum(a.parentPort) - portNum(b.parentPort);
     });
+  });
 
-  container.innerHTML = components.map(comp =>
-    '<div class="topo-component">' +
-    '<div class="topo-row">' + _topoNodeHtml(comp.node, true) + '</div>' +
-    _topoChildrenHtml(comp.children) +
-    '</div>'
-  ).join('');
+  return { nodeMap, adjMap };
+}
+
+function _renderTopologyTree(container, nodes, edges) {
+  const { nodeMap, adjMap } = _buildTopoAdjacency(nodes, edges);
+
+  function renderChildren(parentId) {
+    const kids = adjMap[parentId] || [];
+    if (!kids.length) return '';
+
+    const items = kids.map(c => {
+      const node = nodeMap[c.nodeId];
+      if (!node) return '';
+
+      const isSwitch   = node.managed && node.id !== '__upstream__';
+      const portBadge  = c.parentPort
+        ? `<span class="topo-port">${_topoPortLabel(c.parentPort)}</span>` : '';
+      const iconCls    = isSwitch ? 'sw' : 'dev';
+      const icon       = `<span class="topo-icon ${iconCls}"></span>`;
+      const ipHtml     = `<span class="topo-ip">${node.ip || ''}</span>`;
+      const nameHtml   = isSwitch
+        ? `<span class="topo-sw-name" onclick="openTopoSwitch('${node.id}','${(node.ip||'')}','${(node.name||'').replace(/'/g,"\\\'")}')">${node.name || ''}</span>`
+        : `<span class="topo-dev-name">${node.name || ''}</span>`;
+      const rowCls     = isSwitch ? 'topo-row' : 'topo-row topo-row--dev';
+
+      return `<li class="topo-li${isSwitch ? '' : ' topo-li--dev'}">` +
+        `<div class="${rowCls}">${portBadge}${icon}${ipHtml}${nameHtml}</div>` +
+        renderChildren(c.nodeId) +
+        `</li>`;
+    }).filter(Boolean);
+
+    return `<ul class="topo-ul">${items.join('')}</ul>`;
+  }
+
+  const root     = nodeMap['__upstream__'];
+  const rootName = root ? (root.name || 'Upstream Network') : 'Upstream Network';
+  const rootIp   = root ? (root.ip || '') : '';
+  const rootIpHtml = rootIp ? `<span class="topo-ip">${rootIp}</span>` : '';
+  const html =
+    `<div class="topo-tree-list">` +
+    `<div class="topo-root-row"><span class="topo-icon up"></span>${rootIpHtml}<span class="topo-root-name">${rootName}</span></div>` +
+    renderChildren('__upstream__') +
+    `</div>`;
+
+  container.innerHTML = html;
+}
+
+function topoToggleView() {
+  _topoViewMode = _topoViewMode === "list" ? "canvas" : "list";
+  const btn = document.getElementById("topo-btn-view");
+  if (btn) btn.textContent = _topoViewMode === "list" ? "\u2609 Canvas" : "\u2630 List";
+  const canvasEl = document.getElementById("topology-canvas");
+  if (!canvasEl || !_topoNodes) return;
+  if (_visNetwork) { _visNetwork.destroy(); _visNetwork = null; }
+  canvasEl.innerHTML = '';
+  if (_topoViewMode === "list") {
+    _renderTopologyTree(canvasEl, _topoNodes, _topoEdges);
+  } else {
+    _renderTopologyCanvas(canvasEl, _topoNodes, _topoEdges);
+  }
+}
+
+function _renderTopologyCanvas(container, nodes, edges) {
+  const visNodes = new vis.DataSet(nodes.map(n => {
+    const isUpstream = n.id === "__upstream__";
+    const isDevice   = n.device === true;
+    let color, fontSz, shape, bw;
+    if (isUpstream) {
+      color = { background: "#1e293b", border: "#0f172a", highlight: { background: "#334155", border: "#0f172a" }, hover: { background: "#2d3f52", border: "#0f172a" } };
+      fontSz = 14; shape = "ellipse"; bw = 3;
+    } else if (isDevice) {
+      color = { background: "#15803d", border: "#14532d", highlight: { background: "#16a34a", border: "#14532d" }, hover: { background: "#22c55e", border: "#14532d" } };
+      fontSz = 10; shape = "box"; bw = 1;
+    } else {
+      color = { background: n.managed ? "#0069B4" : "#475569", border: n.managed ? "#004d80" : "#2d3f52", highlight: { background: n.managed ? "#1a85cc" : "#5a6f84", border: "#003d66" }, hover: { background: n.managed ? "#0074b8" : "#536070", border: "#003d66" } };
+      fontSz = 13; shape = "box"; bw = 2;
+    }
+    return {
+      id: n.id,
+      label: isDevice
+        ? ((n.name || n.ip || '') + (n.ip && n.name !== n.ip ? '\n' + n.ip : ''))
+        : (n.ip ? `${n.name}\n${n.ip}` : n.name),
+      title: n.ip ? `${n.name} (${n.ip})` : n.name,
+      color,
+      font: { color: isDevice ? "#ffffff" : "#ffffff", size: fontSz, face: "system-ui, sans-serif", multi: "plain" },
+      shape,
+      borderWidth: bw,
+      borderWidthSelected: bw + 1,
+      shadow: { enabled: true, size: 4, x: 1, y: 2, color: "rgba(0,0,0,0.15)" },
+      margin: isDevice ? { top: 5, right: 8, bottom: 5, left: 8 } : { top: 9, right: 14, bottom: 9, left: 14 },
+    };
+  }));
+
+  const visEdges = new vis.DataSet(edges.map((e, i) => {
+    const sp = _topoPortNum(e.source_port);
+    const tp = _topoPortNum(e.target_port);
+    const isUpstreamEdge = e.source === "__upstream__" || e.target === "__upstream__";
+    const isDeviceEdge   = (e.target || "").startsWith("dev_") || (e.source || "").startsWith("dev_");
+    const label = (sp != null && tp != null) ? `P${sp} \u2194 P${tp}`
+                : (sp != null) ? `P${sp}`
+                : (tp != null) ? `P${tp}` : "";
+    return {
+      id: i,
+      from: e.source,
+      to: e.target,
+      label,
+      font: { size: 10, color: "#94a3b8", background: "#1e2a3a", strokeWidth: 0, align: "middle" },
+      color: isUpstreamEdge
+        ? { color: "#64748b", highlight: "#475569", hover: "#475569" }
+        : isDeviceEdge
+          ? { color: "#166534", highlight: "#15803d", hover: "#22c55e" }
+          : { color: "#94a3b8", highlight: "#0063a3", hover: "#607080" },
+      width: isDeviceEdge ? 1 : isUpstreamEdge ? 1 : 2,
+      dashes: isUpstreamEdge,
+      hoverWidth: 2,
+      selectionWidth: 2,
+      smooth: { type: "cubicBezier", forceDirection: "none", roundness: 0.25 },
+    };
+  }));
+
+  _visNetwork = new vis.Network(container, { nodes: visNodes, edges: visEdges }, _topoNetworkOptions());
+
+  // Click on a managed node -> open switch detail
+  _visNetwork.on("click", params => {
+    if (params.nodes.length === 1) {
+      const nd = nodes.find(n => n.id === params.nodes[0]);
+      if (nd && nd.managed) openSwitchDetail(nd.id, nd.name);
+    }
+  });
+
+  // Pointer cursor on managed nodes
+  _visNetwork.on("hoverNode", params => {
+    const nd = nodes.find(n => n.id === params.node);
+    container.style.cursor = (nd && nd.managed) ? "pointer" : "default";
+  });
+  _visNetwork.on("blurNode", () => { container.style.cursor = "default"; });
+}
+
+function _topoNetworkOptions() {
+  const hierarchical = _topoLayoutMode === "hierarchical";
+  return {
+    layout: hierarchical
+      ? { hierarchical: { enabled: true, direction: "UD", sortMethod: "directed", nodeSpacing: 80, levelSeparation: 120, treeSpacing: 100 } }
+      : { hierarchical: false },
+    physics: {
+      enabled: !hierarchical,
+      stabilization: { iterations: 200 },
+      barnesHut: { gravitationalConstant: -9000, springConstant: 0.04, springLength: 280 },
+    },
+    interaction: { hover: true, tooltipDelay: 200, zoomView: true, dragView: true, dragNodes: true },
+    edges: { arrows: { to: { enabled: false } } },
+  };
 }
 
 function _topoPortNum(p) {
@@ -1455,38 +1639,48 @@ function _topoPortNum(p) {
   return isNaN(n) ? String(p) : n;
 }
 
-function _topoSubtree(id, visited, adj, nodeById) {
-  visited.add(id);
-  const children = (adj[id] || [])
-    .filter(e => !visited.has(e.id))
-    .map(e => ({ localPort: e.localPort, remotePort: e.remotePort, subtree: _topoSubtree(e.id, visited, adj, nodeById) }));
-  return { node: nodeById[id], children };
+function _topoPortLabel(p) {
+  if (!p) return p;
+  const s = String(p).trim();
+  // Shorten HPE Comware style: "GigabitEthernet1/0/5" -> "1/0/5",
+  // "Ten-GigabitEthernet1/0/49" -> "XG1/0/49"
+  const comware = s
+    .replace(/Ten-GigabitEthernet/i, 'XG')
+    .replace(/GigabitEthernet/i, '')
+    .replace(/FastEthernet/i, 'FA');
+  if (comware !== s) return comware.trim();
+  // SNMP fallback formats: "portN" or "bpN" (bridge port == physical port on HP)
+  const m = s.match(/^(?:port|bp)(\d+)$/i);
+  if (m) return `1/0/${m[1]}`;
+  return s;
 }
 
-function _topoChildrenHtml(children) {
-  if (!children.length) return '';
-  return '<div class="topo-children">' +
-    children.map(c => {
-      const sp = c.localPort  != null ? `P${c.localPort}`  : '?';
-      const tp = c.remotePort != null ? `P${c.remotePort}` : '?';
-      return '<div class="topo-child">' +
-        '<div class="topo-row">' +
-          `<span class="topo-port-link">${sp} \u2194 ${tp}</span>` +
-          _topoNodeHtml(c.subtree.node, false) +
-        '</div>' +
-        _topoChildrenHtml(c.subtree.children) +
-        '</div>';
-    }).join('') +
-  '</div>';
+function topoFitAll() {
+  if (_visNetwork) _visNetwork.fit({ animation: { duration: 400, easingFunction: "easeInOutQuad" } });
 }
 
-function _topoNodeHtml(node, isRoot) {
-  const cls = 'topo-node-box' + (isRoot ? ' root' : '') + (!node.managed ? ' unmanaged' : '');
-  return `<div class="${cls}">` +
-    `<span class="topo-sw-icon"></span>` +
-    `<span class="topo-sw-name">${node.name}</span>` +
-    (node.ip ? `<span class="topo-sw-ip">${node.ip}</span>` : '') +
-    '</div>';
+function topoToggleLayout() {
+  // Only meaningful in canvas mode; also available as a keyboard shortcut if needed
+  if (_topoViewMode !== "canvas") return;
+  _topoLayoutMode = _topoLayoutMode === "hierarchical" ? "physics" : "hierarchical";
+  if (_visNetwork) {
+    if (_topoLayoutMode === "physics") {
+      const canvas = document.getElementById("topology-canvas");
+      const w = (canvas.clientWidth  || 800) * 0.6;
+      const h = (canvas.clientHeight || 500) * 0.6;
+      const ids = _visNetwork.body.data.nodes.getIds();
+      _visNetwork.body.data.nodes.update(ids.map(id => ({
+        id,
+        x: (Math.random() - 0.5) * w,
+        y: (Math.random() - 0.5) * h,
+      })));
+      _visNetwork.setOptions(_topoNetworkOptions());
+      setTimeout(() => _visNetwork && _visNetwork.fit({ animation: { duration: 400, easingFunction: "easeInOutQuad" } }), 900);
+    } else {
+      _visNetwork.setOptions(_topoNetworkOptions());
+      setTimeout(() => _visNetwork && _visNetwork.fit({ animation: { duration: 400, easingFunction: "easeInOutQuad" } }), 700);
+    }
+  }
 }
 
 
@@ -1498,6 +1692,12 @@ function loadSettingsView() {
   const { dashInterval, detailInterval } = _getSettings();
   document.getElementById("setting-dash-interval").value = dashInterval / 1000;
   document.getElementById("setting-detail-interval").value = detailInterval / 1000;
+  // Load SNMP / core-switch settings
+  apiFetch("/settings/core-switch").then(cfg => {
+    const seeds = cfg.seed_ips && cfg.seed_ips.length ? cfg.seed_ips.join(", ") : (cfg.ip || "");
+    document.getElementById("snmp-seed-ips").value  = seeds;
+    document.getElementById("snmp-community").value = cfg.community || "public";
+  }).catch(() => {});
 }
 
 function saveSettings() {
@@ -1516,6 +1716,39 @@ function resetSettings() {
   localStorage.removeItem("detailInterval");
   loadSettingsView();
   toast("Reset to defaults (5s)", "success");
+}
+
+async function saveSnmpSettings() {
+  const rawIps    = (document.getElementById("snmp-seed-ips").value || "").trim();
+  const community = (document.getElementById("snmp-community").value || "public").trim();
+  const seed_ips  = rawIps.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+  const enabled   = seed_ips.length > 0;
+  try {
+    await apiFetch("/settings/core-switch", { method: "PUT", body: JSON.stringify({ enabled, seed_ips, community }) });
+    toast("SNMP discovery settings saved", "success");
+    document.getElementById("snmp-test-result").textContent = "";
+  } catch (e) {
+    toast("Save failed: " + e.message, "error");
+  }
+}
+
+async function testSnmpSettings() {
+  const resultEl = document.getElementById("snmp-test-result");
+  resultEl.textContent = "Testing\u2026";
+  resultEl.style.color = "var(--text-muted)";
+  const rawIps    = (document.getElementById("snmp-seed-ips").value || "").trim();
+  const community = (document.getElementById("snmp-community").value || "public").trim();
+  const seed_ips  = rawIps.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+  if (!seed_ips.length) { resultEl.textContent = "Enter at least one seed IP first."; return; }
+  try {
+    await apiFetch("/settings/core-switch", { method: "PUT", body: JSON.stringify({ enabled: true, seed_ips, community }) });
+    const res = await apiFetch("/settings/core-switch/test", { method: "POST" });
+    resultEl.textContent = `\u2713 ${res.sys_name || seed_ips[0]}  \u2014  ${(res.sys_descr || "").split("\n")[0].slice(0, 80)}`;
+    resultEl.style.color = "#4ade80";
+  } catch (e) {
+    resultEl.textContent = "\u2717 " + (e.message || "No response");
+    resultEl.style.color = "#f87171";
+  }
 }
 
 // ---------------------------------------------------------------------------
