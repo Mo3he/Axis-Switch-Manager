@@ -29,8 +29,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SWITCHES_FILE   = Path(__file__).parent / "switches.json"
-SNMP_CFG_FILE   = Path(__file__).parent / "snmp_config.json"
+# Prefer /app/data (Docker volume) so code updates don't overwrite user data;
+# fall back to the backend directory for local development.
+_DATA_DIR = Path("/app/data") if Path("/app/data").exists() else Path(__file__).parent
+SWITCHES_FILE = _DATA_DIR / "switches.json"
+SNMP_CFG_FILE = _DATA_DIR / "snmp_config.json"
 
 
 # ---------------------------------------------------------------------------

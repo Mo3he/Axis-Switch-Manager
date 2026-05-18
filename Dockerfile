@@ -8,8 +8,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ ./backend/
 COPY frontend/ ./frontend/
 
-# switches.json is persisted via a volume mount at runtime
-RUN mkdir -p /app/backend
+# /app/data is where persistent user data (switches.json, snmp_config.json) lives.
+# Mount a volume here so data survives image updates.
+RUN mkdir -p /app/data
 
 EXPOSE 8000
 
