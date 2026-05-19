@@ -53,6 +53,20 @@ def save_switches(switches: list[dict]) -> None:
     SWITCHES_FILE.write_text(json.dumps(switches, indent=2))
 
 
+async def _fetch_switch_mac(ip: str) -> str:
+    """Fetch the switch MAC from /lib/config.js (public endpoint, no auth needed)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"http://{ip}/lib/config.js")
+            if resp.status_code == 200 and not resp.text.startswith("<!DOCTYPE"):
+                m = re.search(r'var configMac\s*=\s*"([^"]+)"', resp.text)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
 _SNMP_CFG_DEFAULTS: dict = {"enabled": False, "seed_ips": [], "community": "public"}
 
 def load_snmp_config() -> dict:
@@ -319,12 +333,14 @@ async def list_switches():
 async def add_switch(payload: SwitchCreate):
     switches = load_switches()
     new_id = str(int(time.time() * 1000))
+    mac = await _fetch_switch_mac(payload.ip)
     switch = {
         "id": new_id,
         "name": payload.name,
         "ip": payload.ip,
         "username": payload.username,
         "password": payload.password,
+        "mac": mac,
     }
     switches.append(switch)
     save_switches(switches)
@@ -340,12 +356,12 @@ async def update_switch(switch_id: str, payload: SwitchUpdate):
                 sw["name"] = payload.name
             if payload.ip is not None:
                 sw["ip"] = payload.ip
+                sw["mac"] = await _fetch_switch_mac(payload.ip)
             if payload.username is not None:
                 sw["username"] = payload.username
             if payload.password is not None:
                 sw["password"] = payload.password
             save_switches(switches)
-            # Invalidate cached client
             return {"ok": True}
     raise HTTPException(status_code=404, detail="Switch not found")
 
@@ -463,30 +479,38 @@ async def switch_traffic(switch_id: str):
 @app.get("/api/dashboard")
 async def dashboard():
     switches = load_switches()
+
+    # Lazily populate MAC for any switch that doesn't have one cached yet.
+    # This uses a plain unauthenticated request so it never occupies a session slot.
+    mac_missing = [sw for sw in switches if not sw.get("mac")]
+    if mac_missing:
+        fetched = await asyncio.gather(*[_fetch_switch_mac(sw["ip"]) for sw in mac_missing])
+        updated = False
+        for sw, mac in zip(mac_missing, fetched):
+            if mac:
+                sw["mac"] = mac
+                updated = True
+        if updated:
+            save_switches(switches)
+
     results = []
     for sw in switches:
         try:
             async with _switch_session(sw) as client:
                 r1 = await client.get("/stat/sys_overview")
                 r2 = await client.get("/stat/poe_status")
-                r3 = await client.get("/lib/config.js")
             raw = r1.text if r1.status_code == 200 and not r1.text.startswith("<!DOCTYPE") else ""
             poe_raw = r2.text if r2.status_code == 200 and not r2.text.startswith("<!DOCTYPE") else ""
             overview = parse_sys_overview(raw)
             poe = parse_poe_status(poe_raw)
             active_ports = sum(1 for p in poe if "ON" in p.get("status", ""))
             total_poe_w = sum(p["current_power"] for p in poe)
-            mac = ""
-            if r3.status_code == 200 and not r3.text.startswith("<!DOCTYPE"):
-                m_mac = re.search(r'var configMac\s*=\s*"([^"]+)"', r3.text)
-                if m_mac:
-                    mac = m_mac.group(1)
             results.append({
                 "id": sw["id"],
                 "name": sw["name"],
                 "ip": sw["ip"],
                 "status": "online",
-                "mac": mac,
+                "mac": sw.get("mac", ""),
                 "overview": overview,
                 "active_poe_ports": active_ports,
                 "total_poe_watts": round(total_poe_w, 1),
@@ -498,7 +522,7 @@ async def dashboard():
                 "name": sw["name"],
                 "ip": sw["ip"],
                 "status": "offline",
-                "mac": "",
+                "mac": sw.get("mac", ""),
                 "overview": {},
                 "active_poe_ports": 0,
                 "total_poe_watts": 0,
@@ -828,6 +852,12 @@ async def bulk_add_switches(payload: BulkAddPayload):
     existing_ips = {sw["ip"] for sw in switches}
     added = []
     skipped = []
+    mac_tasks = [
+        entry for entry in payload.switches if entry.ip not in existing_ips
+    ]
+    macs = await asyncio.gather(*[_fetch_switch_mac(e.ip) for e in mac_tasks])
+    mac_map = {e.ip: mac for e, mac in zip(mac_tasks, macs)}
+
     for entry in payload.switches:
         if entry.ip in existing_ips:
             skipped.append(entry.ip)
@@ -839,6 +869,7 @@ async def bulk_add_switches(payload: BulkAddPayload):
             "ip": entry.ip,
             "username": entry.username,
             "password": entry.password,
+            "mac": mac_map.get(entry.ip, ""),
         }
         switches.append(sw)
         existing_ips.add(entry.ip)
