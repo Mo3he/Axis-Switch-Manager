@@ -149,7 +149,7 @@ async def _switch_session(switch: dict):
             if resp.status_code not in (200, 302):
                 raise HTTPException(status_code=502, detail=f"Login failed for {switch['ip']}")
             client.cookies.update(cookies)
-        except httpx.ConnectError:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.TimeoutException):
             raise HTTPException(status_code=503, detail=f"Cannot connect to {switch['ip']}")
         yield client
     finally:
@@ -184,7 +184,7 @@ async def _get_client(switch: dict) -> httpx.AsyncClient:
             await client.aclose()
             raise HTTPException(status_code=502, detail=f"Login failed for {switch['ip']}")
         client.cookies.update(cookies)
-    except httpx.ConnectError:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.TimeoutException):
         await client.aclose()
         raise HTTPException(status_code=503, detail=f"Cannot connect to {switch['ip']}")
     return client
