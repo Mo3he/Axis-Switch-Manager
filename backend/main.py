@@ -469,17 +469,24 @@ async def dashboard():
             async with _switch_session(sw) as client:
                 r1 = await client.get("/stat/sys_overview")
                 r2 = await client.get("/stat/poe_status")
+                r3 = await client.get("/lib/config.js")
             raw = r1.text if r1.status_code == 200 and not r1.text.startswith("<!DOCTYPE") else ""
             poe_raw = r2.text if r2.status_code == 200 and not r2.text.startswith("<!DOCTYPE") else ""
             overview = parse_sys_overview(raw)
             poe = parse_poe_status(poe_raw)
             active_ports = sum(1 for p in poe if "ON" in p.get("status", ""))
             total_poe_w = sum(p["current_power"] for p in poe)
+            mac = ""
+            if r3.status_code == 200 and not r3.text.startswith("<!DOCTYPE"):
+                m_mac = re.search(r'var configMac\s*=\s*"([^"]+)"', r3.text)
+                if m_mac:
+                    mac = m_mac.group(1)
             results.append({
                 "id": sw["id"],
                 "name": sw["name"],
                 "ip": sw["ip"],
                 "status": "online",
+                "mac": mac,
                 "overview": overview,
                 "active_poe_ports": active_ports,
                 "total_poe_watts": round(total_poe_w, 1),
@@ -491,6 +498,7 @@ async def dashboard():
                 "name": sw["name"],
                 "ip": sw["ip"],
                 "status": "offline",
+                "mac": "",
                 "overview": {},
                 "active_poe_ports": 0,
                 "total_poe_watts": 0,
@@ -2233,10 +2241,19 @@ async def get_topology():
                             "name":    info["sw"]["name"] if info else sw["name"],
                             "ip":      axis_ip,
                             "managed": True,
+                            "mac":     info["raw"].get("own_mac", "") if info else "",
                         })
                         existing_sw_ids.add(sw_node_id)
 
                     # Build the edge for this switch (deferred so all nodes exist first)
+
+                # Enrich any existing SNMP-discovered nodes with Axis MAC data
+                node_by_id_mac = {n["id"]: n for n in nodes if n.get("managed")}
+                for axis_ip, info in axis_ip_to_info.items():
+                    sw_node_id = f"sw_{axis_ip}"
+                    node = node_by_id_mac.get(sw_node_id)
+                    if node and not node.get("mac"):
+                        node["mac"] = info["raw"].get("own_mac", "")
 
                 # Now build inter-switch edges (after all nodes are added)
                 for sw in axis_switches:
@@ -2408,6 +2425,12 @@ async def get_topology():
         own_mac = result["own_mac"]
         sw_own_mac[sw["id"]] = own_mac
         sw_neighbors[sw["id"]] = result["neighbors"]
+
+    # Enrich switch nodes with MAC addresses
+    sw_id_to_node = {n["id"]: n for n in nodes if n.get("managed")}
+    for sw_id, mac in sw_own_mac.items():
+        if mac and sw_id in sw_id_to_node:
+            sw_id_to_node[sw_id]["mac"] = mac
 
     direct: dict[str, dict[str, str]] = {}
     for sw in switches:

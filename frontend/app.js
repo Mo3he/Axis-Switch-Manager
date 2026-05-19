@@ -180,6 +180,7 @@ function renderSwitchCard(sw) {
   const model = ov["Model Name"] || "Unknown";
   const firmware = ov["Firmware Version"] || "-";
   const uptime = ov["System Uptime"] || "-";
+  const mac = sw.mac || "";
   const statusBadge = sw.status === "online"
     ? `<span class="badge badge-online">Online</span>`
     : `<span class="badge badge-offline">Offline</span>`;
@@ -198,7 +199,8 @@ function renderSwitchCard(sw) {
         <div style="flex:1">
           <div class="switch-name">${escHtml(sw.name)}</div>
           <div class="switch-model">${escHtml(model)}</div>
-          <div class="switch-ip">${escHtml(sw.ip)}</div>
+          <div class="switch-ip"><a href="http://${escHtml(sw.ip)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${escHtml(sw.ip)}</a></div>
+          ${mac ? `<div class="switch-mac">${escHtml(mac)}</div>` : ""}
         </div>
         ${statusBadge}
       </div>
@@ -1497,14 +1499,19 @@ function _renderTopologyTree(container, nodes, edges) {
         ? `<span class="topo-port">${_topoPortLabel(c.parentPort)}</span>` : '';
       const iconCls    = isSwitch ? 'sw' : 'dev';
       const icon       = `<span class="topo-icon ${iconCls}"></span>`;
-      const ipHtml     = `<span class="topo-ip">${node.ip || ''}</span>`;
+      const ipHtml     = node.ip
+        ? `<a class="topo-ip" href="http://${escHtml(node.ip)}" target="_blank" rel="noopener noreferrer">${escHtml(node.ip)}</a>`
+        : '<span class="topo-ip"></span>';
+      const macHtml    = isSwitch && node.mac
+        ? `<span class="topo-mac">${escHtml(node.mac)}</span>`
+        : '';
       const nameHtml   = isSwitch
         ? `<span class="topo-sw-name" onclick="openTopoSwitch('${node.id}','${(node.ip||'')}','${(node.name||'').replace(/'/g,"\\\'")}')">${node.name || ''}</span>`
         : `<span class="topo-dev-name">${node.name || ''}</span>`;
       const rowCls     = isSwitch ? 'topo-row' : 'topo-row topo-row--dev';
 
       return `<li class="topo-li${isSwitch ? '' : ' topo-li--dev'}">` +
-        `<div class="${rowCls}">${portBadge}${icon}${ipHtml}${nameHtml}</div>` +
+        `<div class="${rowCls}">${portBadge}${icon}${ipHtml}${macHtml}${nameHtml}</div>` +
         renderChildren(c.nodeId) +
         `</li>`;
     }).filter(Boolean);
@@ -1515,7 +1522,9 @@ function _renderTopologyTree(container, nodes, edges) {
   const root     = nodeMap['__upstream__'];
   const rootName = root ? (root.name || 'Upstream Network') : 'Upstream Network';
   const rootIp   = root ? (root.ip || '') : '';
-  const rootIpHtml = rootIp ? `<span class="topo-ip">${rootIp}</span>` : '';
+  const rootIpHtml = rootIp
+    ? `<a class="topo-ip" href="http://${escHtml(rootIp)}" target="_blank" rel="noopener noreferrer">${escHtml(rootIp)}</a>`
+    : '';
   const html =
     `<div class="topo-tree-list">` +
     `<div class="topo-root-row"><span class="topo-icon up"></span>${rootIpHtml}<span class="topo-root-name">${rootName}</span></div>` +
@@ -1523,6 +1532,16 @@ function _renderTopologyTree(container, nodes, edges) {
     `</div>`;
 
   container.innerHTML = html;
+}
+
+function _makeTopoTooltip(n) {
+  const d = document.createElement('div');
+  d.style.cssText = 'padding:6px 10px;line-height:1.6;font-size:12px';
+  let html = `<strong>${escHtml(n.name)}</strong>`;
+  if (n.ip) html += `<br><a href="http://${escHtml(n.ip)}" target="_blank" rel="noopener noreferrer" style="color:#60a5fa">${escHtml(n.ip)}</a>`;
+  if (n.mac) html += `<br><span style="color:#94a3b8;font-size:11px">${escHtml(n.mac)}</span>`;
+  d.innerHTML = html;
+  return d;
 }
 
 function topoToggleView() {
@@ -1560,7 +1579,7 @@ function _renderTopologyCanvas(container, nodes, edges) {
       label: isDevice
         ? ((n.name || n.ip || '') + (n.ip && n.name !== n.ip ? '\n' + n.ip : ''))
         : (n.ip ? `${n.name}\n${n.ip}` : n.name),
-      title: n.ip ? `${n.name} (${n.ip})` : n.name,
+      title: _makeTopoTooltip(n),
       color,
       font: { color: isDevice ? "#ffffff" : "#ffffff", size: fontSz, face: "system-ui, sans-serif", multi: "plain" },
       shape,

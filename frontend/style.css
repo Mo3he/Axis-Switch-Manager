@@ -223,6 +223,9 @@ body {
 .switch-name { font-weight: 700; font-size: 15px; }
 .switch-model { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
 .switch-ip { font-size: 12px; color: var(--axis-blue); margin-top: 2px; }
+.switch-ip a { color: var(--axis-blue); text-decoration: none; }
+.switch-ip a:hover { text-decoration: underline; }
+.switch-mac { font-size: 11px; color: var(--text-muted); margin-top: 1px; font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; }
 
 .badge {
   display: inline-flex;
@@ -896,6 +899,17 @@ select.priority-sel {
   color: #64748b;
   min-width: 9.5rem;
   flex-shrink: 0;
+  text-decoration: none;
+}
+.topo-ip:hover { color: #93c5fd; text-decoration: underline; }
+
+/* MAC address in topology tree */
+.topo-mac {
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 11px;
+  color: #475569;
+  flex-shrink: 0;
+  min-width: 10rem;
 }
 
 /* Switch name - clickable */
