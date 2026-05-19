@@ -9,8 +9,10 @@ COPY backend/ ./backend/
 COPY frontend/ ./frontend/
 
 # /app/data is where persistent user data (switches.json, snmp_config.json) lives.
-# Mount a volume here so data survives image updates.
+# Declaring VOLUME ensures Docker always creates a volume for this path, even
+# if the user's compose file omits the volume mount.
 RUN mkdir -p /app/data
+VOLUME /app/data
 
 EXPOSE 8000
 
